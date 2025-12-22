@@ -1,0 +1,8 @@
+pandas
+openpyxl
+psycopg2-binary
+python-dotenv
+openai
+tabulate
+streamlit
+pgvector
