@@ -17,7 +17,7 @@ st.set_page_config(
 # Load Environment
 load_dotenv()
 DB_URL = os.getenv("DATABASE_URL")
-OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY")
 
 if not DB_URL:
     st.error("DATABASE_URL not found in .env file.")
@@ -69,7 +69,7 @@ if uploaded_files:
                         tmp_path = tmp_file.name
                     
                     # Run ingestion
-                    process_excel_file(tmp_path, DB_URL, OPENAI_KEY)
+                    process_excel_file(tmp_path, DB_URL, OPENROUTER_KEY)
                     
                     st.sidebar.success(f"Successfully processed {uploaded_file.name}")
                     os.remove(tmp_path)
@@ -189,7 +189,7 @@ if not sheets_df.empty:
         with st.spinner("🤖 Analyzing schema and generating query..."):
             try:
                 # Run the retrieval pipeline
-                result_pack = process_retrieval(user_query, DB_URL, OPENAI_KEY)
+                result_pack = process_retrieval(user_query, DB_URL, OPENROUTER_KEY)
                 
                 if "error" in result_pack:
                     st.error(result_pack["error"])

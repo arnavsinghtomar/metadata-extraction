@@ -18,15 +18,15 @@ def load_environment():
     """Load environment variables from .env file."""
     load_dotenv()
     db_url = os.getenv("DATABASE_URL")
-    openai_key = os.getenv("OPENAI_API_KEY")
+    openrouter_key = os.getenv("OPENROUTER_API_KEY")
     
     if not db_url:
         logging.error("DATABASE_URL not found in .env environment.")
         sys.exit(1)
-    if not openai_key:
-        logging.warning("OPENAI_API_KEY not found. AI features will be skipped.")
+    if not openrouter_key:
+        logging.warning("OPENROUTER_API_KEY not found. AI features will be skipped.")
     
-    return db_url, openai_key
+    return db_url, openrouter_key
 
 def get_db_connection(db_url):
     """Connect to the Postgres database."""
@@ -88,7 +88,10 @@ def generate_ai_analysis(df, sheet_name, table_name, openai_key):
         return None
         
     try:
-        client = OpenAI(api_key=openai_key)
+        client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=openai_key
+        )
         
         # Create a compact representation of the data
         sample_data = df.head(5).to_markdown(index=False)
@@ -107,7 +110,7 @@ def generate_ai_analysis(df, sheet_name, table_name, openai_key):
         )
         
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="openai/gpt-4o-mini",
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": "You are a data analyst. Output valid JSON only."},
@@ -128,10 +131,13 @@ def get_embedding(text, openai_key):
     if not text or not openai_key:
         return None
     try:
-        client = OpenAI(api_key=openai_key)
+        client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=openai_key
+        )
         response = client.embeddings.create(
             input=text,
-            model="text-embedding-3-small"
+            model="openai/text-embedding-3-small"
         )
         return response.data[0].embedding
     except Exception as e:
@@ -224,7 +230,10 @@ def generate_file_level_analysis(file_name, sheet_summaries, openai_key):
         return None
         
     try:
-        client = OpenAI(api_key=openai_key)
+        client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=openai_key
+        )
         
         summaries_text = "\n".join([f"- {s['name']} ({s['category']}): {s['summary']}" for s in sheet_summaries])
         
@@ -237,7 +246,7 @@ def generate_file_level_analysis(file_name, sheet_summaries, openai_key):
         )
         
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="openai/gpt-4o-mini",
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": "You are a data analyst. Output valid JSON only."},

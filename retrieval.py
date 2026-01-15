@@ -54,7 +54,10 @@ def generate_sql_query(user_query, sheet_info, openai_key):
     """
     Generate SQL for a specific sheet given its schema.
     """
-    client = OpenAI(api_key=openai_key)
+    client = OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=openai_key
+    )
     
     table_name = sheet_info['table_name']
     columns_meta = sheet_info.get('columns_metadata', [])
@@ -101,7 +104,7 @@ def generate_sql_query(user_query, sheet_info, openai_key):
     """
     
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="openai/gpt-4o-mini",
         messages=[
             {"role": "system", "content": "You are a SQL expert. Output raw SQL only."},
             {"role": "user", "content": prompt}
@@ -138,7 +141,10 @@ def synthesize_answer(user_query, sql, df, openai_key):
     """
     Generate a natural language answer based on the query results.
     """
-    client = OpenAI(api_key=openai_key)
+    client = OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=openai_key
+    )
     
     if df is None or df.empty:
         return "The query returned no results."
@@ -162,6 +168,7 @@ def synthesize_answer(user_query, sql, df, openai_key):
     Please provide a concise, natural language answer to the user's question based on these results. 
     If the data is a table of rows, summarize the key findings or mention what is listed. 
     If it's a single number, state it clearly.
+    Respond in a structured, user-friendly format with headings and bullet points
     """
     
     response = client.chat.completions.create(
