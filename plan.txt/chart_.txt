@@ -1,0 +1,23 @@
+
+
+
+Retrieve → SQL → DataFrame → Chart Decision → Chart Render → Text Answer
+
+
+
+
+def decide_chart(user_query, df, openai_key):
+
+ {{
+      "show_chart": true/false,
+      "chart_type": "bar | line | pie | scatter | table",
+      "x_axis": "column_name",
+      "y_axis": "column_name",
+     
+    }}
+
+
+
+def render_chart(df, chart_spec):
+option :  Plotly
+          Apache ECharts ( better for react ui )

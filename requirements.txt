@@ -6,3 +6,4 @@ openai
 tabulate
 streamlit
 pgvector
+plotly

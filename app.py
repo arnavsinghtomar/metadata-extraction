@@ -169,7 +169,7 @@ if not sheets_df.empty:
         data_query = f"SELECT * FROM {selected_sheet} LIMIT {limit}"
         try:
             sheet_data = pd.read_sql(data_query, conn)
-            st.dataframe(sheet_data, use_container_width=True)
+            st.dataframe(sheet_data, width="stretch")
         except Exception as e:
             st.error(f"Could not read table: {e}")
 
@@ -197,6 +197,10 @@ if not sheets_df.empty:
                     # 1. Show the Answer
                     st.success(f"**Answer:** {result_pack['final_answer']}")
                     
+                    # 1b. Show Plotly Chart if available
+                    if "chart" in result_pack:
+                        st.plotly_chart(result_pack["chart"], width="stretch")
+                    
                     # 2. Show the "Work" (Expander)
                     with st.expander("🕵️ View Agent's Thought Process"):
                         
@@ -211,7 +215,7 @@ if not sheets_df.empty:
                         
                         # Step 3: Raw Results
                         st.markdown("**3. Raw Data Results:**")
-                        st.dataframe(result_pack['results_df'], use_container_width=True)
+                        st.dataframe(result_pack['results_df'], width="stretch")
                         
             except Exception as e:
                 st.error(f"An unexpected error occurred: {e}")
