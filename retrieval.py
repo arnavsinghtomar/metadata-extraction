@@ -208,39 +208,46 @@ def decide_chart(user_query, df, openai_key):
     print(columns_info)
 
     prompt = f"""
-    You are an expert data analyst deciding whether to show a chart.
+You are an expert data analyst deciding whether to show a chart.
 
-    User Question:
-    "{user_query}"
+User Question:
+"{user_query}"
 
-    Available Data Columns (ONLY these can be used):
-    {columns_info}
+Available Data Columns (ONLY these can be used):
+{columns_info}
 
-    CRITICAL RULES (DO NOT VIOLATE):
-    1. You MUST choose x_axis and y_axis ONLY from the listed columns.
-    2. DO NOT invent columns like "month", "date", "time", "year" unless they EXACTLY exist.
-    3. If data is already aggregated or wide (multiple numeric columns like aug_2023, sep_2023),
-       choose ONE of those columns or return show_chart=false.
-    4. If the result is a single value or very small table (≤2 rows), prefer show_chart=false.
-    5. Line charts are ONLY allowed if an explicit time/date column EXISTS.
-    6. Pie charts should be used ONLY when categories ≤6.
+IMPORTANT DEFINITIONS:
+- Categorical columns: object, string, text
+- Numeric columns: int, float, double
+- Time columns: any column whose name contains date, time, year, month, day
+  (even if dtype is object/string)
 
-    Decision logic:
-    - Category + numeric → bar chart
-    - Time + numeric → line chart
-    - Single numeric value → no chart
-    - Many numeric columns without a time axis → no chart
+CRITICAL RULES:
+1. You MUST choose x_axis and y_axis ONLY from the listed columns.
+2. DO NOT invent columns.
+3. If data is wide (multiple numeric columns), choose ONE numeric column and proceed.
+4. If table has ≤2 rows, show a chart if comparison is still meaningful.
+5. Line charts are allowed if a time-like column exists (name-based).
+6. Pie charts ONLY if categories ≤6.
+7. You MUST make a best-effort decision.
+   Return show_chart=false ONLY if chart is clearly impossible.
 
-    Respond in STRICT JSON ONLY:
+Decision logic:
+- Category + numeric → bar
+- Time + numeric → line
+- Single numeric only → no chart
+- No category or time column → no chart
 
-    {{
-      "show_chart": true,
-      "chart_type": "bar",
-      "x_axis": "column_name",
-      "y_axis": "column_name",
-      "reason": "explanation"
-    }}
-    """
+Respond in STRICT JSON ONLY:
+
+{{
+  "show_chart": true,
+  "chart_type": "bar",
+  "x_axis": "column_name",
+  "y_axis": "column_name",
+  "reason": "short justification"
+}}
+"""
 
 
     response = client.chat.completions.create(
@@ -250,13 +257,15 @@ def decide_chart(user_query, df, openai_key):
     )
 
     content = response.choices[0].message.content.strip()
-    
+    print(content)
+
     # Extract JSON if it's wrapped in text or markdown
     try:
         if "{" in content and "}" in content:
             content = content[content.find("{"):content.rfind("}")+1]
         
         parsed_json = json.loads(content)
+        print(parsed_json)
         return parsed_json
     except Exception as e:
         logging.error(f"Failed to parse chart spec: {e}")
