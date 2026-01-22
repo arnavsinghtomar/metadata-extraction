@@ -5,6 +5,7 @@ import os
 import tempfile
 from dotenv import load_dotenv
 from ingest_excel import process_excel_file, create_metadata_tables, get_db_connection
+import ingest_pdf
 from cleanup import cleanup_database
 
 # Page Config
@@ -46,39 +47,75 @@ if st.sidebar.button("🗑️ Delete All Data", type="primary"):
 
 # 2. Upload Section
 st.sidebar.subheader("Ingest Data")
-uploaded_files = st.sidebar.file_uploader("Upload Excel Files (Max 3)", type=["xlsx", "xls"], accept_multiple_files=True)
+uploaded_files = st.sidebar.file_uploader("Upload Files (Excel/PDF)", type=["xlsx", "xls", "pdf"], accept_multiple_files=True)
 
 if uploaded_files:
-    if len(uploaded_files) > 3:
-        st.sidebar.error("Maximum 3 files allowed. Please remove some.")
+    if len(uploaded_files) > 50:
+        st.sidebar.error("Maximum 50 files allowed. Please remove some.")
     else:
         if st.sidebar.button("Process Files"):
+            import concurrent.futures
+            
             # Ensure metadata tables exist (idempotent)
             conn = get_conn()
             create_metadata_tables(conn)
+            ingest_pdf.create_pdf_tables(conn)
             conn.close()
 
             progress_bar = st.sidebar.progress(0)
+            status_container = st.sidebar.container()
             
-            for i, uploaded_file in enumerate(uploaded_files):
-                st.sidebar.write(f"Processing {uploaded_file.name}...")
+            # 1. Save all files to temp first to unlink from Streamlit upload buffer
+            temp_file_map = []
+            for uploaded_file in uploaded_files:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp_file:
+                    tmp_file.write(uploaded_file.getvalue())
+                    temp_file_map.append((uploaded_file.name, tmp_file.name))
+            
+            total_files = len(temp_file_map)
+            completed = 0
+            results_log = []
+
+            # Wrapper for thread safety and error handling
+            def process_single_file(file_info):
+                original_name, temp_path = file_info
                 try:
-                    # Save to temp file because our ingest script expects a path
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp_file:
-                        tmp_file.write(uploaded_file.getvalue())
-                        tmp_path = tmp_file.name
-                    
-                    # Run ingestion
-                    process_excel_file(tmp_path, DB_URL, OPENAI_KEY)
-                    
-                    st.sidebar.success(f"Successfully processed {uploaded_file.name}")
-                    os.remove(tmp_path)
-                    
+                    if original_name.lower().endswith('.pdf'):
+                        ingest_pdf.process_pdf_file(temp_path, DB_URL, OPENAI_KEY)
+                    else:
+                        process_excel_file(temp_path, DB_URL, OPENAI_KEY)
+                    return True, original_name, temp_path, None
                 except Exception as e:
-                    st.sidebar.error(f"Error processing {uploaded_file.name}: {e}")
-                
-                progress_bar.progress((i + 1) / len(uploaded_files))
+                    return False, original_name, temp_path, str(e)
+
+            # 2. Parallel Execution
+            # Using 8 workers for higher throughput (since LLM calls are removed)
+            MAX_WORKERS = 8 
             
+            with status_container.status(f"Processing {total_files} files with {MAX_WORKERS} threads...", expanded=True) as status:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                    # Submit all tasks
+                    future_to_file = {executor.submit(process_single_file, f): f for f in temp_file_map}
+                    
+                    for future in concurrent.futures.as_completed(future_to_file):
+                        success, name, path, error = future.result()
+                        completed += 1
+                        
+                        # Update Progress
+                        progress_bar.progress(completed / total_files)
+                        
+                        if success:
+                            st.write(f"✅ {name} - Done")
+                        else:
+                            st.error(f"❌ {name} - Failed: {error}")
+                        
+                        # Cleanup temp
+                        try:
+                            os.remove(path)
+                        except:
+                            pass
+                            
+            st.sidebar.success(f"Processing Complete! ({completed}/{total_files})")
             st.rerun()
 
 # Main Content - Data Explorer
@@ -89,6 +126,7 @@ conn = get_conn()
 # Ensure schema is up to date (runs migrations if needed)
 try:
     create_metadata_tables(conn)
+    ingest_pdf.create_pdf_tables(conn)
 except Exception as e:
     st.error(f"Schema migration failed: {e}")
 
@@ -109,12 +147,29 @@ else:
         file_name, 
         uploaded_at, 
         num_sheets,
+        num_pages,
         summary,
         keywords
     FROM files_metadata 
     ORDER BY uploaded_at DESC
     """
-    files_df = pd.read_sql(files_query, conn)
+    try:
+        files_df = pd.read_sql(files_query, conn)
+    except:
+        # Fallback if num_pages col doesn't exist yet (though migration should fix it)
+        files_query = """
+        SELECT 
+            file_id, 
+            file_name, 
+            uploaded_at, 
+            num_sheets,
+            summary,
+            keywords
+        FROM files_metadata 
+        ORDER BY uploaded_at DESC
+        """
+        files_df = pd.read_sql(files_query, conn)
+        files_df['num_pages'] = None
     
     if files_df.empty:
         st.info("No files found.")
@@ -124,7 +179,11 @@ else:
             with st.expander(f"📁 {row['file_name']} ({row['uploaded_at'].strftime('%Y-%m-%d %H:%M')})", expanded=False):
                 col1, col2 = st.columns(2)
                 with col1:
-                    st.markdown(f"**Sheets:** {row['num_sheets']}")
+                    is_pdf = str(row['file_name']).endswith('.pdf')
+                    if is_pdf:
+                         st.markdown(f"**Pages:** {row['num_pages'] if pd.notnull(row['num_pages']) else 'N/A'}")
+                    else:
+                         st.markdown(f"**Sheets:** {row['num_sheets']}")
                     st.markdown(f"**Keywords:** {row['keywords']}")
                 with col2:
                     st.markdown(f"**Summary:** {row['summary']}")

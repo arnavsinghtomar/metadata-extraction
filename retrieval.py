@@ -56,6 +56,49 @@ def search_relevant_sheets(query, db_url, openai_key, limit=3):
     finally:
         conn.close()
 
+def search_pdf_chunks(query, db_url, openai_key, limit=5):
+    """
+    Find relevant PDF text chunks using vector similarity.
+    """
+    embedding = get_embedding(query, openai_key)
+    if not embedding:
+        return []
+
+    conn = get_db_connection(db_url)
+    try:
+        cur = conn.cursor()
+        # Check if table exists first (graceful degradation)
+        cur.execute("SELECT to_regclass('pdf_chunks');")
+        if not cur.fetchone()[0]:
+            return []
+            
+        sql = """
+            SELECT 
+                c.chunk_text,
+                f.file_name,
+                c.page_number,
+                (c.embedding <=> %s::vector) as distance
+            FROM pdf_chunks c
+            JOIN files_metadata f ON c.file_id = f.file_id
+            ORDER BY distance ASC
+            LIMIT %s
+        """
+        cur.execute(sql, (embedding, limit))
+        results = []
+        for row in cur.fetchall():
+            results.append({
+                "text": row[0],
+                "file_name": row[1],
+                "page": row[2],
+                "distance": row[3]
+            })
+        return results
+    except Exception as e:
+        logging.error(f"PDF Search failed: {e}")
+        return []
+    finally:
+        conn.close()
+
 
 
 def generate_sql_query(user_query, sheet_infos, openai_key, feedback=None):
@@ -393,39 +436,47 @@ def execute_query(sql, db_url):
     finally:
         conn.close()
 
-def synthesize_answer(user_query, sql, df, openai_key):
+def synthesize_answer(user_query, sql, df, openai_key, pdf_context=None):
     """
-    Generate a natural language answer based on the query results.
+    Generate a natural language answer based on the query results and optional PDF context.
     """
     client = OpenAI(
         api_key=openai_key,
         base_url="https://openrouter.ai/api/v1"
     )
     
-    if df is None or df.empty:
-        return "The query returned no results."
-    
-    # Create a compact string representation of the data
-    if len(df) > 10:
-        data_summary = df.head(10).to_markdown(index=False)
-        data_summary += f"\n... ({len(df)-10} more rows)"
-    else:
-        data_summary = df.to_markdown(index=False)
+    data_summary = "No structured data results."
+    if df is not None and not df.empty:
+        # Create a compact string representation of the data
+        if len(df) > 10:
+            data_summary = df.head(10).to_markdown(index=False)
+            data_summary += f"\n... ({len(df)-10} more rows)"
+        else:
+            data_summary = df.to_markdown(index=False)
+    elif df is not None:
+         data_summary = "Query executed successfully per row count but returned no data rows."
         
+    context_block = ""
+    if pdf_context:
+        context_block = f"\n\nRelevant Text from Documents:\n{pdf_context}\n"
+
     prompt = f"""
     The user asked: "{user_query}"
     
-    We executed this SQL: 
+    We have the following sources of information:
+    
+    1. Structured Database Results (SQL): 
     {sql}
-    
-    And got these results:
+    Results:
     {data_summary}
+    {context_block}
     
-    Please provide a concise, natural language answer to the user's question based on these results. 
-    If the data is a table of rows, summarize the key findings or mention what is listed. 
-    If it's a single number, state it clearly.
+    Please provide a concise, natural language answer to the user's question integration ALL available information.
+    - If the answer is in the database results, prioritize that.
+    - If the answer is in the document text, use that to answer or explain.
+    - If you use the text, cite the document name if possible.
     
-    IMPORTANT: Provide a brief post-query explanation of how this answer was derived from the data (e.g. "I calculated the sum of the 'amount' column where..." or "I found X rows matching...").
+    IMPORTANT: Provide a brief post-query explanation of how this answer was derived.
     """
     
     response = client.chat.completions.create(
@@ -553,25 +604,26 @@ def search_sheets_keyword_fallback(query, db_url, limit=3):
         conn.close()
 
 
+
 def calculate_confidence(sql, sheet_matches):
     """
     Calculate a heuristic confidence score (0.0 - 1.0).
+    Returns: (score, details_list, is_single_table)
     """
     score = 0.5 # Base score
     details = []
     
     # 1. Similarity signal (0.0 to 1.0 distance, 0 is best)
     # We take the best sheet's distance
-    best_dist = sheet_matches[0].get('distance', 1.0)
+    best_dist = sheet_matches[0].get('distance', 1.0) if sheet_matches else 1.0
     
     # specific handling for our keyword fallback (0.5) vs vector
-    if best_dist is not None:
-        if best_dist < 0.35:
-            score += 0.2
-            details.append("Strong semantic match (distance < 0.35)")
-        elif best_dist > 0.6:
-            score -= 0.2
-            details.append("Weak semantic match (distance > 0.6)")
+    if best_dist < 0.35:
+        score += 0.2
+        details.append("Strong semantic match (distance < 0.35)")
+    elif best_dist > 0.6:
+        score -= 0.2
+        details.append("Weak semantic match (distance > 0.6)")
             
     # 2. SQL Composition
     sql_upper = sql.upper()
@@ -579,11 +631,15 @@ def calculate_confidence(sql, sheet_matches):
     # Find matching tables in SQL
     # We check if the table names provided are actually used in the query
     tables_in_sql = 0
+    used_tables = []
     for s in sheet_matches:
         if s['table_name'] in sql: 
             tables_in_sql += 1
+            used_tables.append(s['table_name'])
     
     details.append(f"Tables used in Query: {tables_in_sql}")
+    
+    is_single_table = (tables_in_sql == 1)
     
     if tables_in_sql == 0:
         score -= 0.4
@@ -597,37 +653,74 @@ def calculate_confidence(sql, sheet_matches):
         score += 0.1
         details.append("Uses filters (WHERE)")
         
-    return min(max(score, 0.0), 1.0), details
+    final_score = min(max(score, 0.0), 1.0)
+    return final_score, details, is_single_table
+
+def generate_suppression_explanation(user_query, reason_details, openai_key):
+    """
+    Generate a user-friendly explanation and suggested questions when suppressing an answer.
+    """
+    client = OpenAI(
+        api_key=openai_key,
+        base_url="https://openrouter.ai/api/v1"
+    )
+    
+    prompt = f"""
+    The user asked: "{user_query}"
+    
+    We are suppressing the answer because the system is not confident.
+    Reasons:
+    {json.dumps(reason_details)}
+    
+    Task:
+    1. Explain politely why we can't answer (e.g., "I couldn't find a clear link between X and Y" or "The relevant data seems missing").
+    2. Suggest 3 specific, rephrased questions that might work better given the context of financial data (Revenue, P&L, Workforce, etc.).
+    
+    Output strictly in markdown.
+    """
+    
+    response = client.chat.completions.create(
+        model="openai/gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.4
+    )
+    return response.choices[0].message.content
 
 def process_retrieval(user_query, db_url, openai_key):
     """
     Orchestration function:
-    1. Search relevant schemas (Vector + Keyword Fallback)
+    1. Search relevant schemas & PDFs
     2. Validate possibility
-    3. Generate SQL
+    3. Generate SQL (Retry if low confidence & single-table)
     4. Execute
-    5. Synthesize
-    
-    Returns a dict with all steps for UI display.
+    5. Conditional Suppression
+    6. Synthesize (Hybrid)
     """
     steps = {}
     debug_log = []
     
-    # 1. Search (Fetch Top 5 now)
+    # 1. Search (Fetch Top candidates)
     debug_log.append("Starting Vector Search...")
     sheets = search_relevant_sheets(user_query, db_url, openai_key, limit=5)
-    debug_log.append(f"Vector Search found {len(sheets)} candidates.")
+    pdf_chunks = search_pdf_chunks(user_query, db_url, openai_key, limit=3)
+    
+    debug_log.append(f"Vector Search found {len(sheets)} sheet candidates and {len(pdf_chunks)} pdf chunks.")
     if sheets:
-        debug_log.append(f"Top Vector Match: {sheets[0]['sheet_name']} (Distance: {sheets[0].get('distance')})")
+        debug_log.append(f"Top Sheet Match: {sheets[0]['sheet_name']} (Distance: {sheets[0].get('distance'):.3f})")
+    if pdf_chunks:
+        debug_log.append(f"Top PDF Match: {pdf_chunks[0]['file_name']} (Distance: {pdf_chunks[0].get('distance'):.3f})")
     
     # Check strictness of vector match
     use_fallback = False
     if not sheets:
         use_fallback = True
-        debug_log.append("Vector search empty. Triggering Fallback.")
+        debug_log.append("Vector search empty for sheets. Triggering Fallback.")
     elif sheets[0]['distance'] > 0.6:
          use_fallback = True
-         debug_log.append(f"Vector match weak (>0.6). Triggering Fallback.")
+         debug_log.append(f"Vector sheet match weak (>0.6). Triggering Fallback.")
          
     if use_fallback:
         logging.info("Vector match weak or empty. Trying keyword fallback.")
@@ -643,11 +736,30 @@ def process_retrieval(user_query, db_url, openai_key):
                 
     steps['debug_log'] = debug_log
     
-    if not sheets:
-        error_msg = "No relevant data found for your query. Please mention the specific sheet name or category."
+    # Format PDF Context
+    pdf_context = None
+    if pdf_chunks:
+        # Filter weak PDF matches (< 0.5 distance)
+        valid_chunks = [c for c in pdf_chunks if c['distance'] < 0.5]
+        if valid_chunks:
+            pdf_context = "\n".join([f"Document: {c['file_name']} (Page {c['page']}):\n{c['text']}\n" for c in valid_chunks])
+            debug_log.append(f"Using {len(valid_chunks)} PDF chunks for context.")
+        else:
+            debug_log.append("PDF matches too weak (>0.5). Ignoring.")
+
+    if not sheets and not pdf_context:
+        error_msg = "No relevant data found for your query. Please mention the specific sheet name, document, or category."
         return {"error": error_msg, "debug_log": debug_log}
     
     steps['sheet_matches'] = sheets # List of sheets
+    
+    # CASE: Only PDF Data found (No Sheets) -> Skip SQL
+    if not sheets and pdf_context:
+        debug_log.append("No relevant sheets found, but PDF context available. Switching to Text-Only mode.")
+        answer = synthesize_answer(user_query, "N/A (Text Only)", None, openai_key, pdf_context=pdf_context)
+        steps['final_answer'] = answer
+        return steps
+
     debug_log.append(f"Final Candidates: {[s['sheet_name'] for s in sheets]}")
     
     # 2. Validation Step
@@ -656,8 +768,14 @@ def process_retrieval(user_query, db_url, openai_key):
     debug_log.append(f"Validation Result: {is_possible}. Reason: {reason}")
     
     if not is_possible:
-        steps['final_answer'] = f"🚫 I cannot answer this question based on the available data.\n\n**Reason:** {reason}"
-        return steps
+         # If PDF context exists, we might still answer even if SQL is impossible!
+         if pdf_context:
+             debug_log.append("SQL Validation failed, but PDF context exists. Attempting answer from text.")
+             steps['final_answer'] = synthesize_answer(user_query, "N/A (Text Only)", None, openai_key, pdf_context=pdf_context)
+             return steps
+         else:
+             steps['final_answer'] = f"🚫 I cannot answer this question based on the available data.\n\n**Reason:** {reason}"
+             return steps
 
     # 3. Generate, Validate, and Execute (Unified Retry Loop)
     final_sql = None
@@ -669,7 +787,6 @@ def process_retrieval(user_query, db_url, openai_key):
         logging.info(f"Retrieval Cycle (Attempt {attempt+1})...")
         
         # A. Generate SQL
-        # If last_feedback is present, the LLM will see "Previous Attempt Failed..."
         sql = generate_sql_query(user_query, sheets, openai_key, feedback=last_feedback)
         
         # B. Validate Schema (Static Check)
@@ -682,8 +799,7 @@ def process_retrieval(user_query, db_url, openai_key):
         # C. Execute SQL (Runtime Check)
         df, exec_error = execute_query(sql, db_url)
         if exec_error:
-            # Clean error message for LLM
-            clean_err = exec_error.replace(db_url, "DB_URL") # Hide sensitive info if any
+            clean_err = exec_error.replace(db_url, "DB_URL") 
             last_feedback = f"Postgres Execution Error: {clean_err}"
             debug_log.append(f"Attempt {attempt+1} Execution Error: {clean_err}")
             continue # Try again
@@ -694,33 +810,93 @@ def process_retrieval(user_query, db_url, openai_key):
         debug_log.append(f"Attempt {attempt+1} Success!")
         break
     
-    # Handle Failure after retries
+    # Handle Failure after standard retries
     if final_sql is None or results_df is None:
+        # If we have PDF context, fallback to that
+        if pdf_context:
+            debug_log.append("SQL Generation failed, but PDF context available. Fallback to text.")
+            steps['final_answer'] = synthesize_answer(user_query, "SQL Failed", None, openai_key, pdf_context=pdf_context)
+            return steps
+            
         steps['error'] = f"I failed to generate a valid query after 4 attempts.\nLast error: {last_feedback}"
-        # Still return steps so user can see debug log
         steps['debug_log'] = debug_log
         return steps
         
+    # 3.5 Calculate Confidence & Logic for Low Confidence Retry
+    confidence, conf_details, is_single_table = calculate_confidence(final_sql, sheets)
+    
+    # RETRY LOGIC: If Low Confidence (<0.4) AND Single Table Usage
+    # We try ONE more time explicitly asking for better joins with Top-K tables.
+    if confidence < 0.4 and is_single_table:
+        debug_log.append("Confidence low due to single-table usage. Retrying with explicit Top-K join instruction...")
+        
+        retry_prompt = (
+            "The previous query used only one table and had low confidence. "
+            "Please explicitly check if you can JOIN the primary table with "
+            "other provided tables (e.g. Entity/Mapping tables) to better answer the user's request. "
+            "If a valid join exists, use it. If not, return the same query."
+        )
+        
+        # We do a 'single shot' retry here for the 'Top-K' requirement
+        sql_retry = generate_sql_query(user_query, sheets, openai_key, feedback=retry_prompt)
+        
+        # Validate & Execute the Retry
+        is_valid_retry, schema_err_retry = validate_sql_schema(sql_retry, sheets)
+        if is_valid_retry:
+            df_retry, exec_err_retry = execute_query(sql_retry, db_url)
+            if not exec_err_retry:
+                # If retry worked, use it!
+                final_sql = sql_retry
+                results_df = df_retry
+                debug_log.append("Top-K Retry Successful. Updated SQL.")
+                # Recalculate confidence
+                confidence, conf_details, is_single_table = calculate_confidence(final_sql, sheets)
+            else:
+                debug_log.append(f"Top-K Retry Execution Failed: {exec_err_retry}")
+        else:
+            debug_log.append(f"Top-K Retry Schema Failed: {schema_err_retry}")
+
+    debug_log.append(f"Final Confidence: {confidence:.2f}")
+    steps['confidence_score'] = confidence
     steps['generated_sql'] = final_sql
     steps['results_df'] = results_df
     
-    # 3.5 Calculate Confidence (on final SQL)
-    confidence, conf_details = calculate_confidence(final_sql, sheets)
-    debug_log.append(f"Final Confidence: {confidence:.2f}")
-    steps['confidence_score'] = confidence
+    # 3.6 Conditional Suppression
     
-    # Threshold for suppression
-    if confidence < 0.4:
-         msg = (
-            f"⚠️ **Low Confidence Response** (Score: {confidence:.2f})\n\n"
-            "I am suppressing the answer because I'm not confident it's correct. "
-            "**Internal Reasoning:**\n" + "\n".join([f"- {d}" for d in conf_details])
-        )
-         steps['final_answer'] = msg
-         return steps
-         
+    # We define 'Weak Semantic Match' as best distance > 0.6 (checked earlier)
+    # Note: If PDF context is strong, we shouldn't suppress!
+    is_weak_match = (sheets[0].get('distance', 0) > 0.6)
+    has_pdf_context = (pdf_context is not None)
+    
+    # We define 'Granularity Unavailable' as:
+    # - validate_question_possibility said False (already handled)
+    # - OR no join keys found (based on confidence details)
+    # - OR result is empty NOT because of filters but structure? (hard to know)
+    # Let's use the 'is_possible' check (which we passed) combined with confidence details
+    granularity_issue = "No joinable identifier" in str(conf_details) # Heuristic
+    
+    should_suppress = False
+    if confidence < 0.4 and not has_pdf_context: # Don't suppress if we have PDF info
+        # Check conditions
+        if is_weak_match and granularity_issue:
+            should_suppress = True
+            debug_log.append("Suppression Triggered: Weak Match + Granularity Issue.")
+        elif is_weak_match and results_df.empty: 
+            # If weak match AND empty results, safe to suppress to avoid "No results" on wrong table
+            should_suppress = True
+            debug_log.append("Suppression Triggered: Weak Match + Empty Results.")
+            
+    if should_suppress:
+        friendly_expl = generate_suppression_explanation(user_query, conf_details, openai_key)
+        steps['final_answer'] = friendly_expl
+        return steps
+
     # 4. Synthesize Answer
-    answer = synthesize_answer(user_query, final_sql, results_df, openai_key)
-    steps['final_answer'] = answer
+    # We pass the results even if confidence is low, unless suppressed above.
+    answer = synthesize_answer(user_query, final_sql, results_df, openai_key, pdf_context=pdf_context)
     
+    if confidence < 0.4 and not should_suppress:
+         answer = f"⚠️ **Low Confidence**: {answer}\n\n*(Note: {', '.join(conf_details)})*"
+         
+    steps['final_answer'] = answer
     return steps
