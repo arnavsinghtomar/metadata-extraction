@@ -1,9 +1,13 @@
+import io
 import streamlit as st
 import pandas as pd
 import psycopg2
 import os
 import tempfile
 from dotenv import load_dotenv
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
 from ingest_excel import process_excel_file, create_metadata_tables, get_db_connection
 from cleanup import cleanup_database
 
@@ -13,6 +17,9 @@ st.set_page_config(
     page_icon="📊",
     layout="wide"
 )
+
+# Google Drive Constants
+SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
 # Load Environment
 load_dotenv()
@@ -46,40 +53,134 @@ if st.sidebar.button("🗑️ Delete All Data", type="primary"):
 
 # 2. Upload Section
 st.sidebar.subheader("Ingest Data")
-uploaded_files = st.sidebar.file_uploader("Upload Excel Files (Max 3)", type=["xlsx", "xls"], accept_multiple_files=True)
 
-if uploaded_files:
-    if len(uploaded_files) > 3:
-        st.sidebar.error("Maximum 3 files allowed. Please remove some.")
-    else:
-        if st.sidebar.button("Process Files"):
-            # Ensure metadata tables exist (idempotent)
-            conn = get_conn()
-            create_metadata_tables(conn)
-            conn.close()
+# Session state for Google Drive
+if "creds" not in st.session_state:
+    st.session_state.creds = None
+if "drive_files" not in st.session_state:
+    st.session_state.drive_files = []
 
-            progress_bar = st.sidebar.progress(0)
-            
-            for i, uploaded_file in enumerate(uploaded_files):
-                st.sidebar.write(f"Processing {uploaded_file.name}...")
-                try:
-                    # Save to temp file because our ingest script expects a path
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp_file:
-                        tmp_file.write(uploaded_file.getvalue())
-                        tmp_path = tmp_file.name
-                    
-                    # Run ingestion
-                    process_excel_file(tmp_path, DB_URL, OPENROUTER_KEY)
-                    
-                    st.sidebar.success(f"Successfully processed {uploaded_file.name}")
-                    os.remove(tmp_path)
-                    
-                except Exception as e:
-                    st.sidebar.error(f"Error processing {uploaded_file.name}: {e}")
+tab_local, tab_drive = st.sidebar.tabs(["📁 Local Upload", "☁️ Google Drive"])
+
+with tab_local:
+    st.markdown("### 📄 Local File Upload")
+    uploaded_files = st.file_uploader("Upload Excel Files (Max 3)", type=["xlsx", "xls"], accept_multiple_files=True, key="local_uploader")
+    if uploaded_files:
+        if len(uploaded_files) > 3:
+            st.error("Maximum 3 files allowed. Please remove some.")
+        else:
+            if st.button("🚀 Process Local Files", use_container_width=True):
+                # Ensure metadata tables exist (idempotent)
+                conn = get_conn()
+                create_metadata_tables(conn)
+                conn.close()
+
+                progress_bar = st.progress(0)
                 
-                progress_bar.progress((i + 1) / len(uploaded_files))
+                for i, uploaded_file in enumerate(uploaded_files):
+                    st.write(f"Processing {uploaded_file.name}...")
+                    try:
+                        # Save to temp file because our ingest script expects a path
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp_file:
+                            tmp_file.write(uploaded_file.getvalue())
+                            tmp_path = tmp_file.name
+                        
+                        # Run ingestion
+                        process_excel_file(tmp_path, DB_URL, OPENROUTER_KEY)
+                        
+                        st.success(f"Successfully processed {uploaded_file.name}")
+                        os.remove(tmp_path)
+                        
+                    except Exception as e:
+                        st.error(f"Error processing {uploaded_file.name}: {e}")
+                    
+                    progress_bar.progress((i + 1) / len(uploaded_files))
+                
+                st.rerun()
+
+with tab_drive:
+    st.markdown("### ☁️ Google Drive Source")
+    if st.session_state.creds is None:
+        st.info("Access files from your Google Drive")
+        if st.button("🔑 Login with Google", use_container_width=True):
+            try:
+                flow = InstalledAppFlow.from_client_secrets_file(
+                    "client2.json",
+                    SCOPES
+                )
+                creds = flow.run_local_server(port=0)
+                st.session_state.creds = creds
+                st.success("✅ Logged in")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Login failed: {e}")
+    else:
+        # Build service
+        service = build("drive", "v3", credentials=st.session_state.creds)
+        
+        # Fetch files if not already done
+        if not st.session_state.drive_files:
+            try:
+                with st.spinner("Fetching files..."):
+                    results = service.files().list(
+                        pageSize=30,
+                        q="mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' or mimeType='application/vnd.ms-excel'",
+                        fields="files(id, name, mimeType)"
+                    ).execute()
+                    st.session_state.drive_files = results.get("files", [])
+            except Exception as e:
+                st.error(f"Failed to fetch files: {e}")
+        
+        if not st.session_state.drive_files:
+            st.warning("No Excel files found in Drive.")
+            if st.button("🔄 Refresh Files", use_container_width=True):
+                st.session_state.drive_files = []
+                st.rerun()
+        else:
+            file_names = [f["name"] for f in st.session_state.drive_files]
+            selected_name = st.selectbox("Select a file from Drive", file_names, key="drive_selector")
             
+            selected_file = next(f for f in st.session_state.drive_files if f["name"] == selected_name)
+            
+            if st.button("⚡ Ingest from Drive", use_container_width=True):
+                conn = get_conn()
+                create_metadata_tables(conn)
+                conn.close()
+                
+                with st.spinner(f"Downloading and processing {selected_name}..."):
+                    try:
+                        # 1. Download from Drive
+                        request = service.files().get_media(fileId=selected_file["id"])
+                        fh = io.BytesIO()
+                        downloader = MediaIoBaseDownload(fh, request)
+                        done = False
+                        while not done:
+                            status, done = downloader.next_chunk()
+                        
+                        # 2. Save to temp file
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp_file:
+                            tmp_file.write(fh.getvalue())
+                            tmp_path = tmp_file.name
+                        
+                        # 3. Run ingestion (same logic as local)
+                        process_excel_file(tmp_path, DB_URL, OPENROUTER_KEY)
+                        
+                        st.success(f"Successfully processed {selected_name}")
+                        os.remove(tmp_path)
+                        st.rerun()
+                        
+                    except Exception as e:
+                        st.error(f"Error processing {selected_name}: {e}")
+        
+        st.divider()
+        if st.button("🚪 Logout from Google", use_container_width=True):
+            st.session_state.creds = None
+            st.session_state.drive_files = []
             st.rerun()
+
+# Deleted the redundant else block that was part of the radio logic
+# if ingest_source == "Local Upload": ... else: ... -> replaced by tabs
+
 
 # Main Content - Data Explorer
 st.header("Database Content")
