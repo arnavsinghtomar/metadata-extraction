@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import pandas as pd
+import plotly.express as px
 from openai import OpenAI
 from ingest_excel import get_embedding, get_db_connection
 
@@ -22,13 +23,15 @@ def search_relevant_sheets(query, db_url, openai_key, limit=3):
         # Searching summary_embedding using cosine distance
         sql = """
             SELECT 
-                sheet_id, 
-                table_name, 
-                sheet_name, 
-                category, 
-                columns_metadata,
-                (summary_embedding <=> %s::vector) as distance
-            FROM sheets_metadata
+                s.sheet_id, 
+                s.table_name, 
+                s.sheet_name, 
+                s.category, 
+                s.columns_metadata,
+                f.file_name,
+                (s.summary_embedding <=> %s::vector) as distance
+            FROM sheets_metadata s
+            JOIN files_metadata f ON s.file_id = f.file_id
             ORDER BY distance ASC
             LIMIT %s
         """
@@ -41,7 +44,8 @@ def search_relevant_sheets(query, db_url, openai_key, limit=3):
                 "sheet_name": row[2],
                 "category": row[3],
                 "columns_metadata": row[4], # JSONB
-                "distance": row[5]
+                "file_name": row[5],
+                "distance": row[6]
             })
         return results
     except Exception as e:
@@ -54,7 +58,10 @@ def generate_sql_query(user_query, sheet_info, openai_key):
     """
     Generate SQL for a specific sheet given its schema.
     """
-    client = OpenAI(api_key=openai_key)
+    client = OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=openai_key
+    )
     
     table_name = sheet_info['table_name']
     columns_meta = sheet_info.get('columns_metadata', [])
@@ -101,7 +108,7 @@ def generate_sql_query(user_query, sheet_info, openai_key):
     """
     
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="openai/gpt-4o-mini",
         messages=[
             {"role": "system", "content": "You are a SQL expert. Output raw SQL only."},
             {"role": "user", "content": prompt}
@@ -134,11 +141,14 @@ def execute_query(sql, db_url):
     finally:
         conn.close()
 
-def synthesize_answer(user_query, sql, df, openai_key):
+def synthesize_answer(user_query, sql, df, sheet_info, openai_key):
     """
-    Generate a natural language answer based on the query results.
+    Generate a natural language answer based on the query results with citations.
     """
-    client = OpenAI(api_key=openai_key)
+    client = OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=openai_key
+    )
     
     if df is None or df.empty:
         return "The query returned no results."
@@ -162,18 +172,141 @@ def synthesize_answer(user_query, sql, df, openai_key):
     Please provide a concise, natural language answer to the user's question based on these results. 
     If the data is a table of rows, summarize the key findings or mention what is listed. 
     If it's a single number, state it clearly.
+    Respond in a structured, user-friendly format with headings and bullet points.
+
+    CRITICAL: At the end of your response, add a section titled "### 📚 Data sources" and include:
+    - **Source File:** {sheet_info.get('file_name', 'Unknown')}
+    - **Sheet Name:** {sheet_info.get('sheet_name', 'Unknown')}
+    - **DB Table:** {sheet_info.get('table_name', 'Unknown')}
     """
     
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="openai/gpt-4o-mini",
         messages=[
             {"role": "system", "content": "You are a helpful data analyst."},
             {"role": "user", "content": prompt}
         ],
+        
         temperature=0.3
     )
     
     return response.choices[0].message.content
+
+def decide_chart(user_query, df, openai_key):
+    """
+    Decide if a visualization is useful and return chart specification.
+    """
+    print("deciding chart")
+    client = OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=openai_key
+    )
+
+    columns_info = ", ".join(
+        [f"{c} ({df[c].dtype})" for c in df.columns]
+    )
+    print(columns_info)
+
+    prompt = f"""
+You are an expert data analyst deciding whether to show a chart.
+
+User Question:
+"{user_query}"
+
+Available Data Columns (ONLY these can be used):
+{columns_info}
+
+IMPORTANT DEFINITIONS:
+- Categorical columns: object, string, text
+- Numeric columns: int, float, double
+- Time columns: any column whose name contains date, time, year, month, day
+  (even if dtype is object/string)
+
+CRITICAL RULES:
+1. You MUST choose x_axis and y_axis ONLY from the listed columns.
+2. DO NOT invent columns.
+3. If data is wide (multiple numeric columns), choose ONE numeric column and proceed.
+4. If table has ≤2 rows, show a chart if comparison is still meaningful.
+5. Line charts are allowed if a time-like column exists (name-based).
+6. Pie charts ONLY if categories ≤6.
+7. You MUST make a best-effort decision.
+   Return show_chart=false ONLY if chart is clearly impossible.
+
+Decision logic:
+- Category + numeric → bar
+- Time + numeric → line
+- Single numeric only → no chart
+- No category or time column → no chart
+
+Respond in STRICT JSON ONLY:
+
+{{
+  "show_chart": true,
+  "chart_type": "bar",
+  "x_axis": "column_name",
+  "y_axis": "column_name",
+  "reason": "short justification"
+}}
+"""
+
+
+    response = client.chat.completions.create(
+        model="openai/gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0
+    )
+
+    content = response.choices[0].message.content.strip()
+    print(content)
+
+    # Extract JSON if it's wrapped in text or markdown
+    try:
+        if "{" in content and "}" in content:
+            content = content[content.find("{"):content.rfind("}")+1]
+        
+        parsed_json = json.loads(content)
+        print(parsed_json)
+        return parsed_json
+    except Exception as e:
+        logging.error(f"Failed to parse chart spec: {e}")
+        return {"show_chart": False}
+
+def render_chart(df, chart_spec):
+    """
+    Render a Plotly chart based on the specification.
+    
+    """
+    print("rendering chart")
+    print(chart_spec)
+    if not chart_spec.get("show_chart"):
+        return None
+
+    chart_type = chart_spec.get("chart_type")
+    x = chart_spec.get("x_axis")
+    y = chart_spec.get("y_axis")
+
+    # Validate columns exist in DF
+    if x and x not in df.columns:
+        logging.error(f"Chart validation failed: {x} not in {df.columns.tolist()}")
+        return None
+    if y and y not in df.columns:
+         logging.error(f"Chart validation failed: {y} not in {df.columns.tolist()}")
+         return None
+
+    try:
+        if chart_type == "bar":
+            return px.bar(df, x=x, y=y, title=chart_spec.get("reason"))
+        elif chart_type == "line":
+            return px.line(df, x=x, y=y, title=chart_spec.get("reason"))
+        elif chart_type == "pie":
+            return px.pie(df, names=x, values=y, title=chart_spec.get("reason"))
+        elif chart_type == "scatter":
+            return px.scatter(df, x=x, y=y, title=chart_spec.get("reason"))
+    except Exception as e:
+        logging.error(f"Chart rendering failed: {e}")
+        return None
+
+    return None
 
 def process_retrieval(user_query, db_url, openai_key):
     """
@@ -208,7 +341,16 @@ def process_retrieval(user_query, db_url, openai_key):
     steps['results_df'] = df
     
     # 4. Synthesize
-    answer = synthesize_answer(user_query, sql, df, openai_key)
+    answer = synthesize_answer(user_query, sql, df, best_sheet, openai_key)
     steps['final_answer'] = answer
     
+    # 5. Charting
+    if df is not None and not df.empty:
+        chart_spec = decide_chart(user_query, df, openai_key)
+        steps['chart_spec'] = chart_spec
+        if chart_spec.get("show_chart"):
+            fig = render_chart(df, chart_spec)
+            if fig:
+                steps['chart'] = fig
+
     return steps
