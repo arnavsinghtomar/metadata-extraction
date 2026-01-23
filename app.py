@@ -17,7 +17,7 @@ st.set_page_config(
 # Load Environment
 load_dotenv()
 DB_URL = os.getenv("DATABASE_URL")
-OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_KEY = os.getenv("OPENROUTER_API_KEY")
 
 if not DB_URL:
     st.error("DATABASE_URL not found in .env file.")
@@ -191,27 +191,49 @@ if not sheets_df.empty:
                 # Run the retrieval pipeline
                 result_pack = process_retrieval(user_query, DB_URL, OPENAI_KEY)
                 
+                # Display Debug Information if available (Success or Error)
+                debug_log = result_pack.get('debug_log', [])
+                if debug_log:
+                    with st.expander("🛠️ Internal Debug Log", expanded=False):
+                        for log_item in debug_log:
+                            st.text(f"• {log_item}")
+
                 if "error" in result_pack:
                     st.error(result_pack["error"])
                 else:
-                    # 1. Show the Answer
+                    # 1. Show Confidence
+                    confidence = result_pack.get('confidence_score')
+                    if confidence is not None:
+                        if confidence >= 0.7:
+                            st.caption(f"🟢 High Confidence ({confidence:.2f})")
+                        elif confidence >= 0.5:
+                            st.caption(f"🟡 Medium Confidence ({confidence:.2f})")
+                        else:
+                            st.caption(f"🔴 Low Confidence ({confidence:.2f})")
+
+                    # 2. Show the Answer
                     st.success(f"**Answer:** {result_pack['final_answer']}")
                     
-                    # 2. Show the "Work" (Expander)
+                    # 3. Show the "Work" (Expander)
                     with st.expander("🕵️ View Agent's Thought Process"):
                         
                         # Step 1: Sheet Selection
-                        sheet = result_pack['sheet_match']
-                        st.markdown(f"**1. Selected Source:** `{sheet['sheet_name']}` (Similarity Score: {sheet['distance']:.4f})")
-                        st.caption(f"Table: {sheet['table_name']}")
+                        sheets = result_pack.get('sheet_matches', [])
+                        st.markdown(f"**1. Selected Sources ({len(sheets)}):**")
+                        for idx, sheet in enumerate(sheets):
+                            dist_val = sheet.get('distance')
+                            dist_str = f"{dist_val:.4f}" if dist_val is not None else "N/A"
+                            st.markdown(f"- **{sheet['sheet_name']}** (Score: {dist_str}) `Table: {sheet['table_name']}`")
                         
                         # Step 2: SQL Generation
-                        st.markdown("**2. Generated SQL:**")
-                        st.code(result_pack['generated_sql'], language="sql")
+                        if 'generated_sql' in result_pack:
+                            st.markdown("**2. Generated SQL:**")
+                            st.code(result_pack['generated_sql'], language="sql")
                         
                         # Step 3: Raw Results
-                        st.markdown("**3. Raw Data Results:**")
-                        st.dataframe(result_pack['results_df'], use_container_width=True)
+                        if 'results_df' in result_pack:
+                            st.markdown("**3. Raw Data Results:**")
+                            st.dataframe(result_pack['results_df'], use_container_width=True)
                         
             except Exception as e:
                 st.error(f"An unexpected error occurred: {e}")
