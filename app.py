@@ -4,6 +4,8 @@ import pandas as pd
 import psycopg2
 import os
 import tempfile
+import concurrent.futures
+import time
 from dotenv import load_dotenv
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
@@ -65,10 +67,10 @@ tab_local, tab_drive = st.sidebar.tabs(["📁 Local Upload", "☁️ Google Driv
 
 with tab_local:
     st.markdown("### 📄 Local File Upload")
-    uploaded_files = st.file_uploader("Upload Excel Files (Max 3)", type=["xlsx", "xls"], accept_multiple_files=True, key="local_uploader")
+    uploaded_files = st.file_uploader("Upload Excel Files (Max 50)", type=["xlsx", "xls"], accept_multiple_files=True, key="local_uploader")
     if uploaded_files:
-        if len(uploaded_files) > 3:
-            st.error("Maximum 3 files allowed. Please remove some.")
+        if len(uploaded_files) > 50:
+            st.error("Maximum 50 files allowed. Please remove some.")
         else:
             if st.button("🚀 Process Local Files", use_container_width=True):
                 # Ensure metadata tables exist (idempotent)
@@ -77,26 +79,49 @@ with tab_local:
                 conn.close()
 
                 progress_bar = st.progress(0)
+                status_text = st.empty()
                 
-                for i, uploaded_file in enumerate(uploaded_files):
-                    st.write(f"Processing {uploaded_file.name}...")
+                # Wrapper for parallel execution
+                def process_single_file(uploaded_file):
                     try:
-                        # Save to temp file because our ingest script expects a path
+                        # Save to temp file
                         with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp_file:
                             tmp_file.write(uploaded_file.getvalue())
                             tmp_path = tmp_file.name
                         
                         # Run ingestion
-                        process_excel_file(tmp_path, DB_URL, OPENROUTER_KEY)
+                        status = process_excel_file(tmp_path, DB_URL, OPENROUTER_KEY, original_filename=uploaded_file.name)
                         
-                        st.success(f"Successfully processed {uploaded_file.name}")
                         os.remove(tmp_path)
-                        
+                        return {"success": True, "status": status, "name": uploaded_file.name}
                     except Exception as e:
-                        st.error(f"Error processing {uploaded_file.name}: {e}")
-                    
-                    progress_bar.progress((i + 1) / len(uploaded_files))
+                        return {"success": False, "name": uploaded_file.name, "error": str(e)}
+
+                # Concurrent execution
+                completed_count = 0
+                total_files = len(uploaded_files)
                 
+                with concurrent.futures.ThreadPoolExecutor(max_workers=min(total_files, 8)) as executor:
+                    future_to_file = {executor.submit(process_single_file, f): f for f in uploaded_files}
+                    
+                    for future in concurrent.futures.as_completed(future_to_file):
+                        result = future.result()
+                        completed_count += 1
+                        
+                        # Update progress
+                        progress = completed_count / total_files
+                        progress_bar.progress(progress)
+                        
+                        if result["success"]:
+                            if result.get("status") == "DUPLICATE":
+                                st.toast(f"ℹ️ Skipped duplicate: {result['name']}")
+                            else:
+                                st.toast(f"✅ Processed {result['name']}")
+                        else:
+                            st.error(f"❌ Error {result['name']}: {result['error']}")
+                
+                st.success("All files processed!")
+                time.sleep(1)
                 st.rerun()
 
 with tab_drive:

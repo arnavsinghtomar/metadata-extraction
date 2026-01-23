@@ -35,28 +35,32 @@ def cleanup_database(db_url):
         cur = conn.cursor()
         
         # 1. Get all dynamic table names from metadata
-        # We need to check if the metadata table exists first
         cur.execute("SELECT to_regclass('sheets_metadata');")
         if not cur.fetchone()[0]:
-            logging.info("Metadata tables do not exist. Nothing to clean.")
-            return
-
-        cur.execute("SELECT table_name FROM sheets_metadata")
-        tables = [row[0] for row in cur.fetchall()]
-        
-        if not tables:
-            logging.info("No sheet tables found in metadata.")
+            logging.info("Metadata tables do not exist. Skipping metadata check.")
         else:
-            logging.info(f"Found {len(tables)} sheet tables to drop.")
+            # Drop all tables that start with 'sheet_' (our data tables)
+            # Fetch from information_schema to be thorough, not just what's in metadata
+            cur.execute("""
+                SELECT table_name 
+                FROM information_schema.tables 
+                WHERE table_schema = 'public' 
+                AND table_name LIKE 'sheet_%'
+            """)
+            tables = [row[0] for row in cur.fetchall()]
             
-            # 2. Drop all sheet tables in batches to be efficient yet safe
-            # Batch size of 100 to prevent massive SQL strings if thousands of sheets exist
-            batch_size = 100
-            for i in range(0, len(tables), batch_size):
-                batch = tables[i:i + batch_size]
-                tables_str = ", ".join(batch)
-                logging.info(f"Dropping batch {i//batch_size + 1} ({len(batch)} tables)...")
-                cur.execute(f"DROP TABLE IF EXISTS {tables_str} CASCADE")
+            if not tables:
+                logging.info("No 'sheet_%' tables found in schema.")
+            else:
+                logging.info(f"Found {len(tables)} data tables to drop.")
+                # PostgreSQL can handle many tables in one DROP statement.
+                # Splitting into chunks of 1000 to be safe but efficient.
+                batch_size = 1000
+                for i in range(0, len(tables), batch_size):
+                    batch = tables[i:i + batch_size]
+                    tables_str = ", ".join([f'"{t}"' for t in batch]) # Quote identifiers
+                    logging.info(f"Dropping batch {i//batch_size + 1} ({len(batch)} tables)...")
+                    cur.execute(f"DROP TABLE IF EXISTS {tables_str} CASCADE")
         
         # 3. Clear metadata tables
         # Using TRUNCATE ... CASCADE to ensure reference integrity is handled (clears sheets_metadata too)

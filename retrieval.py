@@ -21,6 +21,10 @@ def search_relevant_sheets(query, db_url, openai_key, limit=3):
     try:
         cur = conn.cursor()
         # Searching summary_embedding using cosine distance
+        # Hybrid Search: Vector Distance + Filename Keyword match
+        # If the query string overlaps significantly with the filename, boost it.
+        # Simple heuristic: If file_name contains the full query (rare) or query contains file_name.
+        
         sql = """
             SELECT 
                 s.sheet_id, 
@@ -32,10 +36,15 @@ def search_relevant_sheets(query, db_url, openai_key, limit=3):
                 (s.summary_embedding <=> %s::vector) as distance
             FROM sheets_metadata s
             JOIN files_metadata f ON s.file_id = f.file_id
-            ORDER BY distance ASC
+            ORDER BY 
+                (CASE WHEN f.file_name ILIKE %s THEN 0 ELSE 1 END) ASC,
+                distance ASC
             LIMIT %s
         """
-        cur.execute(sql, (embedding, limit))
+        # Prepare fuzzy match param
+        like_query = f"%{query}%"
+        
+        cur.execute(sql, (embedding, like_query, limit))
         results = []
         for row in cur.fetchall():
             results.append({
@@ -141,6 +150,13 @@ def execute_query(sql, db_url):
     finally:
         conn.close()
 
+def is_metadata_query(query):
+    """Check if the user is asking about file/sheet existence rather than data."""
+    q = query.lower().strip()
+    triggers = ["which file", "what file", "which sheet", "what sheet", "where is", "source of"]
+    return any(q.startswith(t) for t in triggers)
+
+
 def synthesize_answer(user_query, sql, df, sheet_info, openai_key):
     """
     Generate a natural language answer based on the query results with citations.
@@ -174,7 +190,12 @@ def synthesize_answer(user_query, sql, df, sheet_info, openai_key):
     If it's a single number, state it clearly.
     Respond in a structured, user-friendly format with headings and bullet points.
 
-    CRITICAL: At the end of your response, add a section titled "### 📚 Data sources" and include:
+    CRITICAL INSTRUCTIONS:
+    1. If the user asks "Which file...", start your answer by explicitly stating the file name.
+    2. Example: "The data containing [Topic] is located in the file **[File Name]** (Sheet: [Sheet Name])."
+    3. Then provide the answer derived from the SQL results.
+    
+    At the end of your response, add a section titled "### 📚 Data sources" and include:
     - **Source File:** {sheet_info.get('file_name', 'Unknown')}
     - **Sheet Name:** {sheet_info.get('sheet_name', 'Unknown')}
     - **DB Table:** {sheet_info.get('table_name', 'Unknown')}
@@ -328,6 +349,29 @@ def process_retrieval(user_query, db_url, openai_key):
     best_sheet = sheets[0]
     steps['sheet_match'] = best_sheet
     
+    # Check if this is a metadata question ("Which file...")
+    if is_metadata_query(user_query):
+        # Skip SQL generation for metadata questions
+        steps['generated_sql'] = "-- Metadata lookup (SQL skipped)"
+        # Create a fake DF containing the metadata answer
+        df = pd.DataFrame([{
+            "File Name": best_sheet['file_name'],
+            "Sheet Name": best_sheet['sheet_name'],
+            "Table Name": best_sheet['table_name'],
+            "Category": best_sheet['category'],
+            "Match Confidence": f"{1 - best_sheet['distance']:.2f}"
+        }])
+        steps['results_df'] = df
+        
+        # Synthesize answer directly from this metadata
+        answer = f"The information you asked about is located in the file **{best_sheet['file_name']}**.\n\n" \
+                 f"**Details:**\n" \
+                 f"- **Sheet Name:** {best_sheet['sheet_name']}\n" \
+                 f"- **Category:** {best_sheet['category']}\n" \
+                 f"- **Confidence:** {1 - best_sheet['distance']:.2%}"
+        steps['final_answer'] = answer
+        return steps
+
     # 2. Generate SQL
     sql = generate_sql_query(user_query, best_sheet, openai_key)
     steps['generated_sql'] = sql
