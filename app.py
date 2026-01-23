@@ -1,12 +1,16 @@
+import io
 import streamlit as st
 import pandas as pd
 import psycopg2
 import os
 import tempfile
 from dotenv import load_dotenv
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
 from ingest_excel import process_excel_file, create_metadata_tables, get_db_connection
-import ingest_pdf
 from cleanup import cleanup_database
+from analytics import compute_business_health
 
 # Page Config
 st.set_page_config(
@@ -15,10 +19,13 @@ st.set_page_config(
     layout="wide"
 )
 
+# Google Drive Constants
+SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+
 # Load Environment
 load_dotenv()
 DB_URL = os.getenv("DATABASE_URL")
-OPENAI_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY")
 
 if not DB_URL:
     st.error("DATABASE_URL not found in .env file.")
@@ -47,76 +54,134 @@ if st.sidebar.button("🗑️ Delete All Data", type="primary"):
 
 # 2. Upload Section
 st.sidebar.subheader("Ingest Data")
-uploaded_files = st.sidebar.file_uploader("Upload Files (Excel/PDF)", type=["xlsx", "xls", "pdf"], accept_multiple_files=True)
 
-if uploaded_files:
-    if len(uploaded_files) > 50:
-        st.sidebar.error("Maximum 50 files allowed. Please remove some.")
-    else:
-        if st.sidebar.button("Process Files"):
-            import concurrent.futures
-            
-            # Ensure metadata tables exist (idempotent)
-            conn = get_conn()
-            create_metadata_tables(conn)
-            ingest_pdf.create_pdf_tables(conn)
-            conn.close()
+# Session state for Google Drive
+if "creds" not in st.session_state:
+    st.session_state.creds = None
+if "drive_files" not in st.session_state:
+    st.session_state.drive_files = []
 
-            progress_bar = st.sidebar.progress(0)
-            status_container = st.sidebar.container()
-            
-            # 1. Save all files to temp first to unlink from Streamlit upload buffer
-            temp_file_map = []
-            for uploaded_file in uploaded_files:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp_file:
-                    tmp_file.write(uploaded_file.getvalue())
-                    temp_file_map.append((uploaded_file.name, tmp_file.name))
-            
-            total_files = len(temp_file_map)
-            completed = 0
-            results_log = []
+tab_local, tab_drive = st.sidebar.tabs(["📁 Local Upload", "☁️ Google Drive"])
 
-            # Wrapper for thread safety and error handling
-            def process_single_file(file_info):
-                original_name, temp_path = file_info
-                try:
-                    if original_name.lower().endswith('.pdf'):
-                        ingest_pdf.process_pdf_file(temp_path, DB_URL, OPENAI_KEY)
-                    else:
-                        process_excel_file(temp_path, DB_URL, OPENAI_KEY)
-                    return True, original_name, temp_path, None
-                except Exception as e:
-                    return False, original_name, temp_path, str(e)
+with tab_local:
+    st.markdown("### 📄 Local File Upload")
+    uploaded_files = st.file_uploader("Upload Excel Files (Max 3)", type=["xlsx", "xls"], accept_multiple_files=True, key="local_uploader")
+    if uploaded_files:
+        if len(uploaded_files) > 3:
+            st.error("Maximum 3 files allowed. Please remove some.")
+        else:
+            if st.button("🚀 Process Local Files", use_container_width=True):
+                # Ensure metadata tables exist (idempotent)
+                conn = get_conn()
+                create_metadata_tables(conn)
+                conn.close()
 
-            # 2. Parallel Execution
-            # Using 8 workers for higher throughput (since LLM calls are removed)
-            MAX_WORKERS = 8 
-            
-            with status_container.status(f"Processing {total_files} files with {MAX_WORKERS} threads...", expanded=True) as status:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                    # Submit all tasks
-                    future_to_file = {executor.submit(process_single_file, f): f for f in temp_file_map}
+                progress_bar = st.progress(0)
+                
+                for i, uploaded_file in enumerate(uploaded_files):
+                    st.write(f"Processing {uploaded_file.name}...")
+                    try:
+                        # Save to temp file because our ingest script expects a path
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp_file:
+                            tmp_file.write(uploaded_file.getvalue())
+                            tmp_path = tmp_file.name
+                        
+                        # Run ingestion
+                        process_excel_file(tmp_path, DB_URL, OPENROUTER_KEY)
+                        
+                        st.success(f"Successfully processed {uploaded_file.name}")
+                        os.remove(tmp_path)
+                        
+                    except Exception as e:
+                        st.error(f"Error processing {uploaded_file.name}: {e}")
                     
-                    for future in concurrent.futures.as_completed(future_to_file):
-                        success, name, path, error = future.result()
-                        completed += 1
+                    progress_bar.progress((i + 1) / len(uploaded_files))
+                
+                st.rerun()
+
+with tab_drive:
+    st.markdown("### ☁️ Google Drive Source")
+    if st.session_state.creds is None:
+        st.info("Access files from your Google Drive")
+        if st.button("🔑 Login with Google", use_container_width=True):
+            try:
+                flow = InstalledAppFlow.from_client_secrets_file(
+                    "client2.json",
+                    SCOPES
+                )
+                creds = flow.run_local_server(port=0)
+                st.session_state.creds = creds
+                st.success("✅ Logged in")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Login failed: {e}")
+    else:
+        # Build service
+        service = build("drive", "v3", credentials=st.session_state.creds)
+        
+        # Fetch files if not already done
+        if not st.session_state.drive_files:
+            try:
+                with st.spinner("Fetching files..."):
+                    results = service.files().list(
+                        pageSize=30,
+                        q="mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' or mimeType='application/vnd.ms-excel'",
+                        fields="files(id, name, mimeType)"
+                    ).execute()
+                    st.session_state.drive_files = results.get("files", [])
+            except Exception as e:
+                st.error(f"Failed to fetch files: {e}")
+        
+        if not st.session_state.drive_files:
+            st.warning("No Excel files found in Drive.")
+            if st.button("🔄 Refresh Files", use_container_width=True):
+                st.session_state.drive_files = []
+                st.rerun()
+        else:
+            file_names = [f["name"] for f in st.session_state.drive_files]
+            selected_name = st.selectbox("Select a file from Drive", file_names, key="drive_selector")
+            
+            selected_file = next(f for f in st.session_state.drive_files if f["name"] == selected_name)
+            
+            if st.button("⚡ Ingest from Drive", use_container_width=True):
+                conn = get_conn()
+                create_metadata_tables(conn)
+                conn.close()
+                
+                with st.spinner(f"Downloading and processing {selected_name}..."):
+                    try:
+                        # 1. Download from Drive
+                        request = service.files().get_media(fileId=selected_file["id"])
+                        fh = io.BytesIO()
+                        downloader = MediaIoBaseDownload(fh, request)
+                        done = False
+                        while not done:
+                            status, done = downloader.next_chunk()
                         
-                        # Update Progress
-                        progress_bar.progress(completed / total_files)
+                        # 2. Save to temp file
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp_file:
+                            tmp_file.write(fh.getvalue())
+                            tmp_path = tmp_file.name
                         
-                        if success:
-                            st.write(f"✅ {name} - Done")
-                        else:
-                            st.error(f"❌ {name} - Failed: {error}")
+                        # 3. Run ingestion (same logic as local)
+                        process_excel_file(tmp_path, DB_URL, OPENROUTER_KEY)
                         
-                        # Cleanup temp
-                        try:
-                            os.remove(path)
-                        except:
-                            pass
-                            
-            st.sidebar.success(f"Processing Complete! ({completed}/{total_files})")
+                        st.success(f"Successfully processed {selected_name}")
+                        os.remove(tmp_path)
+                        st.rerun()
+                        
+                    except Exception as e:
+                        st.error(f"Error processing {selected_name}: {e}")
+        
+        st.divider()
+        if st.button("🚪 Logout from Google", use_container_width=True):
+            st.session_state.creds = None
+            st.session_state.drive_files = []
             st.rerun()
+
+# Deleted the redundant else block that was part of the radio logic
+# if ingest_source == "Local Upload": ... else: ... -> replaced by tabs
+
 
 # Main Content - Data Explorer
 st.header("Database Content")
@@ -126,7 +191,6 @@ conn = get_conn()
 # Ensure schema is up to date (runs migrations if needed)
 try:
     create_metadata_tables(conn)
-    ingest_pdf.create_pdf_tables(conn)
 except Exception as e:
     st.error(f"Schema migration failed: {e}")
 
@@ -147,29 +211,12 @@ else:
         file_name, 
         uploaded_at, 
         num_sheets,
-        num_pages,
         summary,
         keywords
     FROM files_metadata 
     ORDER BY uploaded_at DESC
     """
-    try:
-        files_df = pd.read_sql(files_query, conn)
-    except:
-        # Fallback if num_pages col doesn't exist yet (though migration should fix it)
-        files_query = """
-        SELECT 
-            file_id, 
-            file_name, 
-            uploaded_at, 
-            num_sheets,
-            summary,
-            keywords
-        FROM files_metadata 
-        ORDER BY uploaded_at DESC
-        """
-        files_df = pd.read_sql(files_query, conn)
-        files_df['num_pages'] = None
+    files_df = pd.read_sql(files_query, conn)
     
     if files_df.empty:
         st.info("No files found.")
@@ -179,11 +226,7 @@ else:
             with st.expander(f"📁 {row['file_name']} ({row['uploaded_at'].strftime('%Y-%m-%d %H:%M')})", expanded=False):
                 col1, col2 = st.columns(2)
                 with col1:
-                    is_pdf = str(row['file_name']).endswith('.pdf')
-                    if is_pdf:
-                         st.markdown(f"**Pages:** {row['num_pages'] if pd.notnull(row['num_pages']) else 'N/A'}")
-                    else:
-                         st.markdown(f"**Sheets:** {row['num_sheets']}")
+                    st.markdown(f"**Sheets:** {row['num_sheets']}")
                     st.markdown(f"**Keywords:** {row['keywords']}")
                 with col2:
                     st.markdown(f"**Summary:** {row['summary']}")
@@ -203,7 +246,8 @@ SELECT
     s.num_columns,
     s.summary,
     s.category,
-    s.keywords
+    s.keywords,
+    s.columns_metadata
 FROM sheets_metadata s
 JOIN files_metadata f ON s.file_id = f.file_id
 ORDER BY f.uploaded_at DESC, s.sheet_name
@@ -228,9 +272,71 @@ if not sheets_df.empty:
         data_query = f"SELECT * FROM {selected_sheet} LIMIT {limit}"
         try:
             sheet_data = pd.read_sql(data_query, conn)
-            st.dataframe(sheet_data, use_container_width=True)
+            st.dataframe(sheet_data, width="stretch")
         except Exception as e:
             st.error(f"Could not read table: {e}")
+
+    # ==========================================
+    # 2.5 Business Health Analytics
+    # ==========================================
+    st.divider()
+    col_h1, col_h2 = st.columns([2, 1])
+    with col_h1:
+        st.subheader("🏥 Business Health Check")
+        st.caption("Automated financial health analysis and trend detection.")
+    with col_h2:
+        if st.button("🔍 Run Health Analysis", type="primary", use_container_width=True):
+            with st.spinner("Analyzing financial signals..."):
+                health_data = compute_business_health(DB_URL, OPENROUTER_KEY, sel_meta)
+                st.session_state.health_results = health_data
+
+    if "health_results" in st.session_state and st.session_state.health_results:
+        res = st.session_state.health_results
+        
+        if "error" in res:
+            st.error(res["error"])
+        elif res.get("status") == "Insufficient Data":
+            st.warning(f"**{res['status']}** - {res['reason']}")
+            st.info(f"💡 {res['suggested_action']}")
+        else:
+            # 1. Status Indicator
+            status_map = {
+                "Healthy": ("✅", "success"),
+                "Warning": ("⚠️", "warning"),
+                "Risk": ("🚨", "error")
+            }
+            icon, mode = status_map.get(res["status"], ("ℹ️", "info"))
+            
+            st.markdown(f"### Status: {icon} {res['status']}")
+            
+            # 2. Key Metrics
+            m = res["metrics"]
+            t = res["trends"]
+            
+            def get_delta(trend):
+                return "5%" if trend == "up" else "-5%" if trend == "down" else None
+            
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Revenue", f"${m['revenue']:,.0f}", delta=get_delta(t['revenue']))
+            c2.metric("Expenses", f"${m['cost']:,.0f}", delta=get_delta(t['cost']), delta_color="inverse")
+            c3.metric("Profit", f"${m['profit']:,.0f}", delta=get_delta(t['profit']))
+            c4.metric("Margin", f"{m['margin']}%")
+            
+            # 3. LLM Summary
+            st.info(f"**Analyst Summary:** {res['summary']}")
+            
+            # 4. Trends Visualization
+            if res.get("history"):
+                hist_df = pd.DataFrame(res["history"])
+                # Map time column (it will be 'index' if we resampled or the original name)
+                time_col = 'index' if 'index' in hist_df.columns else hist_df.columns[0]
+                
+                chart_data = hist_df.melt(id_vars=[time_col], value_vars=["total_revenue", "total_cost", "total_profit"])
+                import plotly.express as px
+                fig = px.line(chart_data, x=time_col, y="value", color="variable", 
+                             title="Financial Trends Over Time",
+                             labels={"value": "Amount ($)", "variable": "Metric"})
+                st.plotly_chart(fig, use_container_width=True)
 
     # ==========================================
     # 3. Chat Interface (Retrieval Strategy)
@@ -248,51 +354,33 @@ if not sheets_df.empty:
         with st.spinner("🤖 Analyzing schema and generating query..."):
             try:
                 # Run the retrieval pipeline
-                result_pack = process_retrieval(user_query, DB_URL, OPENAI_KEY)
+                result_pack = process_retrieval(user_query, DB_URL, OPENROUTER_KEY)
                 
-                # Display Debug Information if available (Success or Error)
-                debug_log = result_pack.get('debug_log', [])
-                if debug_log:
-                    with st.expander("🛠️ Internal Debug Log", expanded=False):
-                        for log_item in debug_log:
-                            st.text(f"• {log_item}")
-
                 if "error" in result_pack:
                     st.error(result_pack["error"])
                 else:
-                    # 1. Show Confidence
-                    confidence = result_pack.get('confidence_score')
-                    if confidence is not None:
-                        if confidence >= 0.7:
-                            st.caption(f"🟢 High Confidence ({confidence:.2f})")
-                        elif confidence >= 0.5:
-                            st.caption(f"🟡 Medium Confidence ({confidence:.2f})")
-                        else:
-                            st.caption(f"🔴 Low Confidence ({confidence:.2f})")
-
-                    # 2. Show the Answer
+                    # 1. Show the Answer
                     st.success(f"**Answer:** {result_pack['final_answer']}")
                     
-                    # 3. Show the "Work" (Expander)
+                    # 1b. Show Plotly Chart if available
+                    if "chart" in result_pack:
+                        st.plotly_chart(result_pack["chart"], width="stretch")
+                    
+                    # 2. Show the "Work" (Expander)
                     with st.expander("🕵️ View Agent's Thought Process"):
                         
                         # Step 1: Sheet Selection
-                        sheets = result_pack.get('sheet_matches', [])
-                        st.markdown(f"**1. Selected Sources ({len(sheets)}):**")
-                        for idx, sheet in enumerate(sheets):
-                            dist_val = sheet.get('distance')
-                            dist_str = f"{dist_val:.4f}" if dist_val is not None else "N/A"
-                            st.markdown(f"- **{sheet['sheet_name']}** (Score: {dist_str}) `Table: {sheet['table_name']}`")
+                        sheet = result_pack['sheet_match']
+                        st.markdown(f"**1. Selected Source:** `{sheet['sheet_name']}` (Similarity Score: {sheet['distance']:.4f})")
+                        st.caption(f"Table: {sheet['table_name']}")
                         
                         # Step 2: SQL Generation
-                        if 'generated_sql' in result_pack:
-                            st.markdown("**2. Generated SQL:**")
-                            st.code(result_pack['generated_sql'], language="sql")
+                        st.markdown("**2. Generated SQL:**")
+                        st.code(result_pack['generated_sql'], language="sql")
                         
                         # Step 3: Raw Results
-                        if 'results_df' in result_pack:
-                            st.markdown("**3. Raw Data Results:**")
-                            st.dataframe(result_pack['results_df'], use_container_width=True)
+                        st.markdown("**3. Raw Data Results:**")
+                        st.dataframe(result_pack['results_df'], width="stretch")
                         
             except Exception as e:
                 st.error(f"An unexpected error occurred: {e}")

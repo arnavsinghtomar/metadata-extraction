@@ -44,7 +44,7 @@ pip install -r requirements.txt
 Create a `.env` file in the root directory:
 ```bash
 DATABASE_URL=postgresql://user:password@localhost:5432/your_db_name
-OPENAI_API_KEY=sk-your-openai-key-here
+OPENROUTER_API_KEY=sk-your-openai-key-here
 ```
 
 ## 🏃‍♂️ Usage

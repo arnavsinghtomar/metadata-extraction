@@ -4,4 +4,6 @@ __pycache__/
 *.pyc
 .venv/
 *.xlsx
-uv.lock
+.venv/
+.env
+client2.json
