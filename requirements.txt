@@ -1,11 +1,11 @@
+streamlit
 pandas
-openpyxl
 psycopg2-binary
 python-dotenv
 openai
-tabulate
-streamlit
 pgvector
 plotly
 google-auth-oauthlib
 google-api-python-client
+openpyxl
+tabulate
