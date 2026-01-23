@@ -10,6 +10,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from ingest_excel import process_excel_file, create_metadata_tables, get_db_connection
 from cleanup import cleanup_database
+from analytics import compute_business_health
 
 # Page Config
 st.set_page_config(
@@ -245,7 +246,8 @@ SELECT
     s.num_columns,
     s.summary,
     s.category,
-    s.keywords
+    s.keywords,
+    s.columns_metadata
 FROM sheets_metadata s
 JOIN files_metadata f ON s.file_id = f.file_id
 ORDER BY f.uploaded_at DESC, s.sheet_name
@@ -273,6 +275,68 @@ if not sheets_df.empty:
             st.dataframe(sheet_data, width="stretch")
         except Exception as e:
             st.error(f"Could not read table: {e}")
+
+    # ==========================================
+    # 2.5 Business Health Analytics
+    # ==========================================
+    st.divider()
+    col_h1, col_h2 = st.columns([2, 1])
+    with col_h1:
+        st.subheader("🏥 Business Health Check")
+        st.caption("Automated financial health analysis and trend detection.")
+    with col_h2:
+        if st.button("🔍 Run Health Analysis", type="primary", use_container_width=True):
+            with st.spinner("Analyzing financial signals..."):
+                health_data = compute_business_health(DB_URL, OPENROUTER_KEY, sel_meta)
+                st.session_state.health_results = health_data
+
+    if "health_results" in st.session_state and st.session_state.health_results:
+        res = st.session_state.health_results
+        
+        if "error" in res:
+            st.error(res["error"])
+        elif res.get("status") == "Insufficient Data":
+            st.warning(f"**{res['status']}** - {res['reason']}")
+            st.info(f"💡 {res['suggested_action']}")
+        else:
+            # 1. Status Indicator
+            status_map = {
+                "Healthy": ("✅", "success"),
+                "Warning": ("⚠️", "warning"),
+                "Risk": ("🚨", "error")
+            }
+            icon, mode = status_map.get(res["status"], ("ℹ️", "info"))
+            
+            st.markdown(f"### Status: {icon} {res['status']}")
+            
+            # 2. Key Metrics
+            m = res["metrics"]
+            t = res["trends"]
+            
+            def get_delta(trend):
+                return "5%" if trend == "up" else "-5%" if trend == "down" else None
+            
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Revenue", f"${m['revenue']:,.0f}", delta=get_delta(t['revenue']))
+            c2.metric("Expenses", f"${m['cost']:,.0f}", delta=get_delta(t['cost']), delta_color="inverse")
+            c3.metric("Profit", f"${m['profit']:,.0f}", delta=get_delta(t['profit']))
+            c4.metric("Margin", f"{m['margin']}%")
+            
+            # 3. LLM Summary
+            st.info(f"**Analyst Summary:** {res['summary']}")
+            
+            # 4. Trends Visualization
+            if res.get("history"):
+                hist_df = pd.DataFrame(res["history"])
+                # Map time column (it will be 'index' if we resampled or the original name)
+                time_col = 'index' if 'index' in hist_df.columns else hist_df.columns[0]
+                
+                chart_data = hist_df.melt(id_vars=[time_col], value_vars=["total_revenue", "total_cost", "total_profit"])
+                import plotly.express as px
+                fig = px.line(chart_data, x=time_col, y="value", color="variable", 
+                             title="Financial Trends Over Time",
+                             labels={"value": "Amount ($)", "variable": "Metric"})
+                st.plotly_chart(fig, use_container_width=True)
 
     # ==========================================
     # 3. Chat Interface (Retrieval Strategy)
