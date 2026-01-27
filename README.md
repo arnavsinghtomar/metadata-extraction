@@ -1,83 +1,188 @@
-# 📊 Financial Data Extraction Agent
+# 📊 Financial Data Extraction & Analysis System
 
-A robust, AI-powered system for ingesting, analyzing, and querying complex financial Excel data. This application automatically turns messy Excel sheets into structured PostgreSQL tables and allows you to "talk" to your data using natural language, with advanced features for bulk processing, cloud integration, and automated analytics.
+AI-powered financial data extraction and analysis platform with multi-agent architecture, RAG-based querying, and automated business health monitoring.
 
-## 🚀 Key Features
+## ✨ Features
 
-### 1. High-Performance Ingestion
-*   **Bulk Processing**: Upload up to **50 Excel files** simultaneously.
-*   **Concurrency**: Uses multi-threading to process files and sheets in parallel (up to 40 concurrent database connections).
-*   **Versioning & Deduplication**:
-    *   **Smart Skipping**: Identical files (same content) are automatically skipped.
-    *   **Versioning**: Modified files with the same name are ingested as new versions (v1, v2, etc.).
+### 🤖 Multi-Agent System
+- **Master Agent**: Intelligent task routing and orchestration
+- **Ingestion Agent**: Process Excel, PDF, and CSV files
+- **Query Agent**: Natural language queries using RAG
+- **Analytics Agent**: Business health analysis and insights
+- **Maintenance Agent**: Database management and optimization
 
-### 2. Intelligent Data Handling
-*   **Automated Schema**: Dynamically creates typed PostgreSQL tables for every sheet.
-*   **Normalization**: Handles complex column names, reserved keywords, and leading digits.
-*   **AI Enrichment**: Generates summaries, keywords, and categorizations using `gpt-4o-mini`.
+### 📈 Core Capabilities
+- **File Processing**: Excel, PDF, CSV with AI-powered metadata extraction
+- **Semantic Search**: Vector-based search using OpenAI embeddings
+- **SQL Generation**: Natural language to SQL conversion
+- **Business Analytics**: Automated financial health checks
+- **Trend Detection**: Revenue, cost, and profit trend analysis
+- **Interactive Charts**: Plotly visualizations
 
-### 3. Advanced Analytics & Visualization
-*   **Chat with Data (RAG)**:
-    *   Ask specific questions: *"What was 2024 revenue?"*
-    *   Ask metadata questions: *"Which file contains the vendor list?"*
-*   **Smart Charting**: Automatically detects if a query requires visualization and generates interactive **Plotly** charts (Bar, Line, Pie, Scatter).
-*   **Business Health Check**: A dedicated module that analyzes your data to flag risks (e.g., "Expenses growing faster than revenue") and calculate profit margins.
+### 🔍 Advanced Features
+- **Google Drive Integration**: Direct file upload from Google Drive
+- **Duplicate Detection**: Content-based file versioning
+- **Multi-sheet Processing**: Parallel processing for faster ingestion
+- **Type-Safe Agents**: Pydantic-based validation
 
-### 4. Integrations
-*   **Google Drive**: Connect directly to Google Drive to select and ingest Excel files from the cloud.
+## 🚀 Quick Start
 
-## 🛠️ Technology Stack
+### Prerequisites
+- Python 3.8+
+- PostgreSQL database (Neon recommended)
+- OpenRouter API key
 
-*   **Frontend**: Streamlit
-*   **Database**: PostgreSQL (Neon.tech supported) + `pgvector`
-*   **AI/LLM**: OpenAI API (`gpt-4o-mini`), Google Gemini Embeddings (`google/gemini-embedding-001`)
-*   **Visualization**: Plotly Interactive Charts
-*   **Cloud**: Google Drive API
+### Installation
 
-## ⚙️ Setup & Installation
-
-### 1. Prerequisites
-*   Python 3.10+
-*   PostgreSQL with `vector` extension enabled.
-
-### 2. Clone and Install
+1. Clone the repository:
 ```bash
-git clone https://github.com/your-repo/financial-data-extraction.git
-cd financial-data-extraction
+git clone https://github.com/YOUR_USERNAME/metadata-extraction-new.git
+cd metadata-extraction-new
+```
 
-python3 -m venv .venv
-source .venv/bin/activate
+2. Install dependencies:
+```bash
 pip install -r requirements.txt
 ```
 
-### 3. Environment Configuration
-Create a `.env` file in the root directory:
+3. Set up environment variables:
 ```bash
-DATABASE_URL=postgresql://user:password@host:5432/dbname
-OPENROUTER_API_KEY=sk-your-key
+cp .env.example .env
+# Edit .env with your credentials
 ```
 
-### 4. Google Drive (Optional)
-To use Google Drive integration, place your `client_secret.json` (OAuth 2.0 Credentials) in the root directory.
-
-## 🏃‍♂️ Usage
-
-### Running the App
+4. Run the application:
 ```bash
 streamlit run app.py
 ```
 
-### Workflow
-1.  **Ingest**:
-    *   **Local**: Drag & Drop up to 50 files. The system handles them in parallel.
-    *   **Drive**: Authenticate and pick files from your drive.
-2.  **Health Check**: Click "**Run Health Analysis**" in the sidebar for an instant financial audit.
-3.  **Chat**:
-    *   *"Show me a line chart of monthly revenue."*
-    *   *"Compare Q1 vs Q2 expenses."*
-    *   *"Which file has the payroll data?"*
+## 🔧 Configuration
 
-## 🧠 Architecture Highlights
-*   **Connection Pooling**: Uses `psycopg2.pool.ThreadedConnectionPool` (Size: 60) to handle high-concurrency ingestion.
-*   **Hybrid Search**: Retrieval combines vector similarity (for semantic match) with metadata keyword boosting (for filename matches).
-*   **Metadata-First**: Questions about file locations bypass SQL generation and query the metadata layer directly.
+Create a `.env` file with:
+
+```env
+DATABASE_URL=postgresql://user:password@host/database
+OPENROUTER_API_KEY=your_openrouter_api_key
+```
+
+## 📖 Usage
+
+### File Ingestion
+```python
+from agents import MasterAgent
+
+master = MasterAgent(db_url=DB_URL, openai_key=API_KEY)
+
+task = master.create_task(
+    task_type="ingest",
+    payload={"file_path": "data.xlsx"}
+)
+
+response = master.execute(task)
+```
+
+### Natural Language Queries
+```python
+task = master.create_task(
+    task_type="query",
+    payload={"question": "What was total revenue in 2024?"}
+)
+
+response = master.execute(task)
+print(response.result['answer'])
+```
+
+### Business Health Analysis
+```python
+task = master.create_task(
+    task_type="analyze",
+    payload={"sheet_info": {...}}
+)
+
+response = master.execute(task)
+print(response.result['status'])  # Healthy/Warning/Risk
+```
+
+## 🏗️ Architecture
+
+```
+metadata-extraction-new/
+├── agents/                 # Multi-agent system
+│   ├── base_agent.py      # Pydantic base classes
+│   ├── master_agent.py    # Orchestrator
+│   ├── ingestion_agent.py # File processing
+│   ├── query_agent.py     # RAG queries
+│   ├── analytics_agent.py # Business intelligence
+│   └── maintenance_agent.py # Database ops
+├── ingest_excel.py        # Excel file processing
+├── ingest_pdf.py          # PDF processing
+├── ingest_structured.py   # CSV processing
+├── retrieval.py           # RAG pipeline
+├── analytics.py           # Business health logic
+├── cleanup.py             # Database cleanup
+├── app.py                 # Streamlit UI
+└── requirements.txt       # Dependencies
+```
+
+## 🛠️ Tech Stack
+
+- **Backend**: Python, PostgreSQL, pgvector
+- **Frontend**: Streamlit
+- **AI/ML**: OpenAI (via OpenRouter), embeddings
+- **Data Processing**: Pandas, openpyxl, pypdf
+- **Visualization**: Plotly
+- **Type Safety**: Pydantic
+- **Cloud**: Neon Database
+
+## 📊 Database Schema
+
+### files_metadata
+- `file_id` (UUID)
+- `file_name` (TEXT)
+- `uploaded_at` (TIMESTAMP)
+- `summary_embedding` (vector 3072)
+- `keywords_embedding` (vector 3072)
+
+### sheets_metadata
+- `sheet_id` (UUID)
+- `file_id` (UUID FK)
+- `table_name` (TEXT)
+- `summary_embedding` (vector 3072)
+- `columns_metadata` (JSONB)
+
+## 🤝 Contributing
+
+Contributions are welcome! Please:
+1. Fork the repository
+2. Create a feature branch
+3. Commit your changes
+4. Push to the branch
+5. Open a Pull Request
+
+## 📝 License
+
+MIT License - see LICENSE file for details
+
+## 🐛 Known Issues
+
+- Vector dimension mismatch: Run `python fix_vector_dimensions.py` to fix
+- Slow processing: Increase `max_workers` in `ingest_excel.py` line 706
+
+## 🔮 Roadmap
+
+- [ ] Add export agent for report generation
+- [ ] Implement notification system
+- [ ] Add data validation agent
+- [ ] Support for more file formats
+- [ ] Advanced anomaly detection
+- [ ] Scheduled automated reports
+
+## 📧 Contact
+
+For questions or support, please open an issue on GitHub.
+
+## 🙏 Acknowledgments
+
+- OpenRouter for AI API access
+- Neon for serverless PostgreSQL
+- Streamlit for the amazing framework

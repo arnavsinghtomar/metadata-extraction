@@ -35,7 +35,7 @@ def get_embedding(text, api_key):
         )
         response = client.embeddings.create(
             input=text,
-            model="openai/text-embedding-3-small"
+            model="openai/text-embedding-3-large"
         )
         return response.data[0].embedding
     except Exception as e:
@@ -61,7 +61,7 @@ def get_embeddings_batch(texts, api_key):
         # Limit batch size if needed, but usually fine for <100
         response = client.embeddings.create(
             input=valid_texts,
-            model="openai/text-embedding-3-small"
+            model="openai/text-embedding-3-large"
         )
         
         # Map results back to original list (handling empty strings)

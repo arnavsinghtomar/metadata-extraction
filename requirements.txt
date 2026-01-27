@@ -1,11 +1,32 @@
+# Core Web Framework
 streamlit
+
+# Data Processing
 pandas
+openpyxl
+
+# Database
 psycopg2-binary
-python-dotenv
-openai
 pgvector
+
+# Environment Variables
+python-dotenv
+
+# AI/ML
+openai
+
+# Visualization
 plotly
+
+# Google Drive Integration
 google-auth-oauthlib
 google-api-python-client
-openpyxl
+
+# PDF Processing
+pypdf
+
+# Utilities
 tabulate
+
+# Agent System
+pydantic>=2.0.0

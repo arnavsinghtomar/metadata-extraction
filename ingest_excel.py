@@ -273,7 +273,7 @@ def get_embedding(text, openai_key):
         )
         response = client.embeddings.create(
             input=text,
-            model="google/gemini-embedding-001"
+            model="openai/text-embedding-3-large"
         )
         return response.data[0].embedding
     except Exception as e:
@@ -703,7 +703,7 @@ def process_excel_file(file_path, db_url, openai_key, original_filename=None):
         # Use ThreadPoolExecutor for Sheet-Level Parallelism
         # This handles Parsing (CPU/IO) + SubTable Processing (IO) in parallel
         sheet_summaries_list = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
             future_to_sheet = {executor.submit(process_sheet_wrapper, s): s for s in sheet_names}
             
             for future in concurrent.futures.as_completed(future_to_sheet):

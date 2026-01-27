@@ -40,8 +40,8 @@ def create_pdf_tables(conn):
                 num_sheets INTEGER,
                 summary TEXT,
                 keywords TEXT,
-                summary_embedding vector(1536),
-                keywords_embedding vector(1536)
+                summary_embedding vector(3072),
+                keywords_embedding vector(3072)
             );
         """)
         
@@ -63,7 +63,7 @@ def create_pdf_tables(conn):
                 page_number INTEGER,
                 chunk_index INTEGER,
                 chunk_text TEXT,
-                embedding vector(1536)
+                embedding vector(3072)
             );
         """)
         

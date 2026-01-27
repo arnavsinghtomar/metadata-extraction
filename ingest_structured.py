@@ -137,8 +137,8 @@ def process_structured_file(file_path, db_url, openai_key, original_filename=Non
                     file_type TEXT,
                     summary TEXT,
                     keywords TEXT,
-                    summary_embedding vector(1536),
-                    keywords_embedding vector(1536),
+                    summary_embedding vector(3072),
+                    keywords_embedding vector(3072),
                     uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
@@ -151,9 +151,9 @@ def process_structured_file(file_path, db_url, openai_key, original_filename=Non
                     num_rows INT,
                     summary TEXT,
                     keywords TEXT,
-                    summary_embedding vector(1536),
-                    keywords_embedding vector(1536),
-                    columns_embedding vector(1536)
+                    summary_embedding vector(3072),
+                    keywords_embedding vector(3072),
+                    columns_embedding vector(3072)
                 );
             """)
             
