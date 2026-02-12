@@ -5,13 +5,14 @@ import pandas as pd
 import plotly.express as px
 from openai import OpenAI
 from ingest_excel import get_embedding, get_db_connection
+import rbac
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def search_relevant_sheets(query, db_url, openai_key, limit=3):
+def search_relevant_sheets(query, db_url, openai_key, user_role, limit=3):
     """
-    Find relevant sheets using vector similarity on summary and keywords.
+    Find relevant sheets using vector similarity + RBAC filtering.
     """
     embedding = get_embedding(query, openai_key)
     if not embedding:
@@ -32,10 +33,19 @@ def search_relevant_sheets(query, db_url, openai_key, limit=3):
                 s.sheet_name, 
                 s.category, 
                 s.columns_metadata,
+                s.data_domain,
+                s.sensitivity_level,
                 f.file_name,
+                p.allow_aggregation,
+                p.allow_raw_rows,
                 (s.summary_embedding <=> %s::vector) as distance
             FROM sheets_metadata s
             JOIN files_metadata f ON s.file_id = f.file_id
+            JOIN retrieval_policies p 
+              ON p.data_domain = s.data_domain
+             AND p.sensitivity_level = s.sensitivity_level
+            WHERE p.role = %s
+              AND p.allowed = true
             ORDER BY 
                 (CASE WHEN f.file_name ILIKE %s THEN 0 ELSE 1 END) ASC,
                 distance ASC
@@ -44,7 +54,7 @@ def search_relevant_sheets(query, db_url, openai_key, limit=3):
         # Prepare fuzzy match param
         like_query = f"%{query}%"
         
-        cur.execute(sql, (embedding, like_query, limit))
+        cur.execute(sql, (embedding, user_role, like_query, limit))
         results = []
         for row in cur.fetchall():
             results.append({
@@ -53,8 +63,12 @@ def search_relevant_sheets(query, db_url, openai_key, limit=3):
                 "sheet_name": row[2],
                 "category": row[3],
                 "columns_metadata": row[4], # JSONB
-                "file_name": row[5],
-                "distance": row[6]
+                "data_domain": row[5],
+                "sensitivity_level": row[6],
+                "file_name": row[7],
+                "allow_aggregation": row[8],
+                "allow_raw_rows": row[9],
+                "distance": row[10]
             })
         return results
     except Exception as e:
@@ -99,6 +113,23 @@ def generate_sql_query(user_query, sheet_info, openai_key):
     else:
         schema_desc += "(No detailed column metadata available. Use generic queries.)"
         
+    # Get access control constraints
+    allow_raw = sheet_info.get('allow_raw_rows', False)
+    allow_agg = sheet_info.get('allow_aggregation', True)
+    
+    # Build access control rules
+    access_rules = "\n🔐 CRITICAL ACCESS CONTROL RULES:\n"
+    if not allow_raw:
+        access_rules += """
+- You are NOT allowed to return raw row-level data
+- You MUST use aggregation functions: SUM, AVG, COUNT, MAX, MIN, GROUP BY
+- NEVER use SELECT * or individual row selection
+- Example: Instead of "SELECT vendor, amount FROM table", use "SELECT vendor, SUM(amount) FROM table GROUP BY vendor"
+"""
+    
+    if not allow_agg and not allow_raw:
+        access_rules += "- User has NO access to this data domain. Return error.\n"
+
     prompt = f"""
     You are a PostgreSQL expert assisting a user with a financial query.
     
@@ -107,7 +138,9 @@ def generate_sql_query(user_query, sheet_info, openai_key):
     
     User Question: "{user_query}"
     
-    Goal: Write a valid PostgreSQL query to answer the question.
+    {access_rules}
+    
+    Goal: Write a valid PostgreSQL query to answer the question while respecting access rules.
     
     Rules:
     1. Use ONLY the table and columns provided in the schema.
@@ -329,7 +362,7 @@ def render_chart(df, chart_spec):
 
     return None
 
-def process_retrieval(user_query, db_url, openai_key):
+def process_retrieval(user_query, db_url, openai_key, user_role="Analyst"):
     """
     Orchestration function:
     1. Search relevant sheet
@@ -342,7 +375,7 @@ def process_retrieval(user_query, db_url, openai_key):
     steps = {}
     
     # 1. Search
-    sheets = search_relevant_sheets(user_query, db_url, openai_key, limit=1)
+    sheets = search_relevant_sheets(user_query, db_url, openai_key, user_role, limit=1)
     if not sheets:
         return {"error": "No relevant data found for your query."}
     
@@ -373,8 +406,17 @@ def process_retrieval(user_query, db_url, openai_key):
         return steps
 
     # 2. Generate SQL
-    sql = generate_sql_query(user_query, best_sheet, openai_key)
-    steps['generated_sql'] = sql
+    try:
+        sql = generate_sql_query(user_query, best_sheet, openai_key)
+        steps['generated_sql'] = sql
+        
+        # 2b. Enforce RBAC at runtime (Defense-in-depth)
+        rbac.validate_sql_access(sql, best_sheet)
+        
+    except PermissionError as e:
+        return {"error": str(e)}
+    except Exception as e:
+        return {"error": f"Failed to generate query: {e}"}
     
     # 3. Execute
     df, error = execute_query(sql, db_url)

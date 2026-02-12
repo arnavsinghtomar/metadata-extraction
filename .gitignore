@@ -9,6 +9,7 @@ __pycache__/
 # Virtual environment
 venv/
 env/
+.venv/
 
 # Google OAuth credentials
 client2.json

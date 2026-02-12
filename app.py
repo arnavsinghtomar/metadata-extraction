@@ -43,6 +43,14 @@ st.title("📊 Financial Data Manager")
 # Sidebar - Actions
 st.sidebar.header("Actions")
 
+# 0. User Context
+st.sidebar.subheader("User Profile")
+user_role = st.sidebar.selectbox(
+    "Select Your Role",
+    ["CEO", "Finance_Manager", "Analyst", "Employee"],
+    index=2 # Default to Analyst
+)
+
 # 1. Cleanup Section
 st.sidebar.subheader("Danger Zone")
 if st.sidebar.button("🗑️ Delete All Data", type="primary"):
@@ -67,6 +75,12 @@ tab_local, tab_drive = st.sidebar.tabs(["📁 Local Upload", "☁️ Google Driv
 
 with tab_local:
     st.markdown("### 📄 Local File Upload")
+    col_d, col_s = st.columns(2)
+    with col_d:
+        domain = st.selectbox("Data Domain", ["finance", "hr", "sales", "operations", "general"], index=0, key="local_domain")
+    with col_s:
+        sensitivity = st.selectbox("Sensitivity", ["public", "internal", "confidential", "restricted"], index=1, key="local_sens")
+    
     uploaded_files = st.file_uploader("Upload Excel Files (Max 50)", type=["xlsx", "xls"], accept_multiple_files=True, key="local_uploader")
     if uploaded_files:
         if len(uploaded_files) > 50:
@@ -90,7 +104,7 @@ with tab_local:
                             tmp_path = tmp_file.name
                         
                         # Run ingestion
-                        status = process_excel_file(tmp_path, DB_URL, OPENROUTER_KEY, original_filename=uploaded_file.name)
+                        status = process_excel_file(tmp_path, DB_URL, OPENROUTER_KEY, domain, sensitivity, original_filename=uploaded_file.name)
                         
                         os.remove(tmp_path)
                         return {"success": True, "status": status, "name": uploaded_file.name}
@@ -168,6 +182,12 @@ with tab_drive:
             
             selected_file = next(f for f in st.session_state.drive_files if f["name"] == selected_name)
             
+            col_dd, col_ss = st.columns(2)
+            with col_dd:
+                g_domain = st.selectbox("Data Domain", ["finance", "hr", "sales", "operations", "general"], index=0, key="g_domain")
+            with col_ss:
+                g_sensitivity = st.selectbox("Sensitivity", ["public", "internal", "confidential", "restricted"], index=1, key="g_sens")
+            
             if st.button("⚡ Ingest from Drive", use_container_width=True):
                 conn = get_conn()
                 create_metadata_tables(conn)
@@ -189,7 +209,7 @@ with tab_drive:
                             tmp_path = tmp_file.name
                         
                         # 3. Run ingestion (same logic as local)
-                        process_excel_file(tmp_path, DB_URL, OPENROUTER_KEY)
+                        process_excel_file(tmp_path, DB_URL, OPENROUTER_KEY, g_domain, g_sensitivity)
                         
                         st.success(f"Successfully processed {selected_name}")
                         os.remove(tmp_path)
@@ -379,7 +399,7 @@ if not sheets_df.empty:
         with st.spinner("🤖 Analyzing schema and generating query..."):
             try:
                 # Run the retrieval pipeline
-                result_pack = process_retrieval(user_query, DB_URL, OPENROUTER_KEY)
+                result_pack = process_retrieval(user_query, DB_URL, OPENROUTER_KEY, user_role)
                 
                 if "error" in result_pack:
                     st.error(result_pack["error"])

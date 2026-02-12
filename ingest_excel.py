@@ -14,6 +14,7 @@ from pgvector.psycopg2 import register_vector
 import concurrent.futures
 import threading
 import psycopg2.pool
+import rbac
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -305,7 +306,7 @@ def get_embeddings_in_parallel(text_map, openai_key):
                 results[key] = None
     return results
 
-def process_sub_table_task(df, file_id, clean_sheet_name, db_url, openai_key):
+def process_sub_table_task(df, file_id, clean_sheet_name, db_url, openai_key, data_domain="general", sensitivity_level="internal"):
     """
     Worker function to process a single sub-table in a separate thread.
     Uses pooled connections and parallel API calls.
@@ -433,11 +434,11 @@ def process_sub_table_task(df, file_id, clean_sheet_name, db_url, openai_key):
                 """
                 INSERT INTO sheets_metadata 
                 (sheet_id, file_id, sheet_name, table_name, num_rows, num_columns, 
-                 category, summary, keywords, summary_embedding, keywords_embedding, columns_metadata) 
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 category, summary, keywords, summary_embedding, keywords_embedding, columns_metadata, data_domain, sensitivity_level) 
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (str(sheet_id), str(file_id), clean_sheet_name, table_name, len(df), len(df.columns),
-                 category, summary, keywords, summary_embedding, keywords_embedding, json.dumps(column_metadata_list))
+                 category, summary, keywords, summary_embedding, keywords_embedding, json.dumps(column_metadata_list), data_domain, sensitivity_level)
             )
         
         conn.commit()
@@ -484,7 +485,9 @@ def create_metadata_tables(conn):
             keywords TEXT,
             summary_embedding vector(3072),
             keywords_embedding vector(3072),
-            columns_metadata JSONB
+            columns_metadata JSONB,
+            data_domain TEXT,
+            sensitivity_level TEXT
         )
         """
     ]
@@ -493,6 +496,9 @@ def create_metadata_tables(conn):
         with conn.cursor() as cur:
             for command in commands:
                 cur.execute(command)
+                
+            # Perform RBAC setup (add columns if missing, create policies)
+            rbac.create_rbac_tables(conn)
                 
             # Perform migrations on existing tables if needed
             # 1. files_metadata migration
@@ -608,7 +614,7 @@ def compute_file_hash(file_path):
             hash_md5.update(chunk)
     return hash_md5.hexdigest()
 
-def process_excel_file(file_path, db_url, openai_key, original_filename=None):
+def process_excel_file(file_path, db_url, openai_key, data_domain="general", sensitivity_level="internal", original_filename=None):
     """
     Main logic to ingest Excel file.
     Uses Threaded Pool and optimized flow.
@@ -692,7 +698,7 @@ def process_excel_file(file_path, db_url, openai_key, original_filename=None):
                         clean_sheet_name = f"{sheet_name}_Table{sub_i+1}"
                     
                     # Process synchronously in this thread
-                    res = process_sub_table_task(sub_df, file_id, clean_sheet_name, db_url, openai_key)
+                    res = process_sub_table_task(sub_df, file_id, clean_sheet_name, db_url, openai_key, data_domain, sensitivity_level)
                     if res:
                         local_results.append(res)
                 return local_results
