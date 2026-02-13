@@ -131,14 +131,14 @@ async def upload_batch(
     """
     Upload and process multiple files concurrently
     
-    - **files**: List of files to upload (max 20 files)
+    - **files**: List of files to upload (max 1500 files)
     
     Returns:
     - Batch processing results
     """
     
-    if len(files) > 20:
-        raise HTTPException(status_code=400, detail="Maximum 20 files allowed per batch")
+    if len(files) > 1500:
+        raise HTTPException(status_code=400, detail="Maximum 1500 files allowed per batch")
     
     results = []
     successful = 0

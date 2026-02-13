@@ -81,10 +81,10 @@ with tab_local:
     with col_s:
         sensitivity = st.selectbox("Sensitivity", ["public", "internal", "confidential", "restricted"], index=1, key="local_sens")
     
-    uploaded_files = st.file_uploader("Upload Excel Files (Max 50)", type=["xlsx", "xls"], accept_multiple_files=True, key="local_uploader")
+    uploaded_files = st.file_uploader("Upload Excel Files (Max 1500)", type=["xlsx", "xls"], accept_multiple_files=True, key="local_uploader")
     if uploaded_files:
-        if len(uploaded_files) > 50:
-            st.error("Maximum 50 files allowed. Please remove some.")
+        if len(uploaded_files) > 1500:
+            st.error("Maximum 1500 files allowed. Please remove some.")
         else:
             if st.button("🚀 Process Local Files", use_container_width=True):
                 # Ensure metadata tables exist (idempotent)

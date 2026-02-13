@@ -263,6 +263,101 @@ def generate_ai_analysis(df, sheet_name, table_name, openai_key):
         logging.error(f"Failed to generate AI analysis for {sheet_name}: {e}")
         return None
 
+def generate_ai_analysis_batch(sheet_data_list, openai_key):
+    """
+    Generate AI analysis for multiple sheets in a single API call.
+    This is much faster than calling generate_ai_analysis() for each sheet.
+    
+    Args:
+        sheet_data_list: List of dicts with keys: {df, sheet_name, table_name}
+        openai_key: OpenAI API key
+        
+    Returns:
+        List of analysis dicts (same order as input), each with {category, summary, keywords}
+    """
+    if not sheet_data_list or not openai_key:
+        return [None] * len(sheet_data_list)
+    
+    try:
+        client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=openai_key
+        )
+        
+        # Build combined prompt for all sheets
+        sheets_info = []
+        for i, data in enumerate(sheet_data_list):
+            df = data['df']
+            sheet_name = data['sheet_name']
+            
+            # Create compact representation
+            sample_data = df.head(3).to_markdown(index=False) if len(df) > 0 else "No data"
+            columns = ", ".join(df.columns.tolist())
+            rows, cols = df.shape
+            
+            sheet_info = (
+                f"Sheet {i+1}: {sheet_name}\n"
+                f"Columns: {columns}\n"
+                f"Shape: {rows} rows, {cols} columns\n"
+                f"Sample:\n{sample_data}"
+            )
+            sheets_info.append(sheet_info)
+        
+        combined_prompt = (
+            f"Analyze these {len(sheet_data_list)} Excel sheets and return a JSON array with analysis for each.\n\n"
+            + "\n\n---\n\n".join(sheets_info) +
+            f"\n\nReturn a JSON array with {len(sheet_data_list)} objects, each containing:\n"
+            f"1. 'category': A short category name (e.g., 'Financial', 'Inventory', 'HR', 'Sales')\n"
+            f"2. 'summary': A concise 1-2 sentence summary\n"
+            f"3. 'keywords': A comma-separated string of 5-10 identifying keywords\n\n"
+            f"Return ONLY the JSON array, no other text."
+        )
+        
+        response = client.chat.completions.create(
+            model="openai/gpt-4o-mini",
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": "You are a data analyst. Output valid JSON only."},
+                {"role": "user", "content": combined_prompt}
+            ],
+            max_tokens=300 * len(sheet_data_list),  # Scale tokens with number of sheets
+            temperature=0.3
+        )
+        
+        content = response.choices[0].message.content
+        parsed = json.loads(content)
+        
+        # Handle both array and object with 'sheets' key
+        if isinstance(parsed, list):
+            results = parsed
+        elif isinstance(parsed, dict) and 'sheets' in parsed:
+            results = parsed['sheets']
+        elif isinstance(parsed, dict) and 'analyses' in parsed:
+            results = parsed['analyses']
+        else:
+            # Try to extract array from dict
+            for key in parsed:
+                if isinstance(parsed[key], list):
+                    results = parsed[key]
+                    break
+            else:
+                logging.warning(f"Unexpected batch analysis format: {parsed}")
+                return [None] * len(sheet_data_list)
+        
+        # Ensure we have the right number of results
+        if len(results) != len(sheet_data_list):
+            logging.warning(f"Batch analysis returned {len(results)} results for {len(sheet_data_list)} sheets")
+            # Pad with None if needed
+            while len(results) < len(sheet_data_list):
+                results.append(None)
+        
+        return results[:len(sheet_data_list)]
+        
+    except Exception as e:
+        logging.error(f"Failed to generate batch AI analysis: {e}")
+        return [None] * len(sheet_data_list)
+
+
 def get_embedding(text, openai_key):
     """Generate vector embedding for text."""
     if not text or not openai_key:
@@ -306,10 +401,73 @@ def get_embeddings_in_parallel(text_map, openai_key):
                 results[key] = None
     return results
 
-def process_sub_table_task(df, file_id, clean_sheet_name, db_url, openai_key, data_domain="general", sensitivity_level="internal"):
+def get_embeddings_batch(texts, openai_key):
+    """
+    Fetch embeddings for multiple texts in a single API call.
+    This is much faster than individual calls.
+    
+    Args:
+        texts: list of strings to embed
+        openai_key: OpenAI API key
+        
+    Returns:
+        list of embeddings (same order as input texts)
+    """
+    if not texts or not openai_key:
+        return [None] * len(texts)
+    
+    # Filter out None/empty texts but remember their positions
+    text_positions = []
+    valid_texts = []
+    for i, text in enumerate(texts):
+        if text and text.strip():
+            text_positions.append(i)
+            valid_texts.append(text)
+    
+    if not valid_texts:
+        return [None] * len(texts)
+    
+    try:
+        client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=openai_key
+        )
+        
+        # OpenAI allows up to 2048 inputs in a single batch
+        # We'll process in chunks if needed
+        chunk_size = 2048
+        all_embeddings = []
+        
+        for i in range(0, len(valid_texts), chunk_size):
+            chunk = valid_texts[i:i + chunk_size]
+            response = client.embeddings.create(
+                input=chunk,
+                model="openai/text-embedding-3-large"
+            )
+            all_embeddings.extend([item.embedding for item in response.data])
+        
+        # Reconstruct full list with None for empty positions
+        results = [None] * len(texts)
+        for pos, embedding in zip(text_positions, all_embeddings):
+            results[pos] = embedding
+        
+        return results
+        
+    except Exception as e:
+        logging.error(f"Batch embedding failed: {e}")
+        return [None] * len(texts)
+
+
+def process_sub_table_task(df, file_id, clean_sheet_name, db_url, openai_key, data_domain="general", sensitivity_level="internal", skip_ai_analysis=False):
     """
     Worker function to process a single sub-table in a separate thread.
-    Uses pooled connections and parallel API calls.
+    
+    Args:
+        skip_ai_analysis: If True, skips AI analysis and returns data for batch processing
+    
+    Returns:
+        If skip_ai_analysis=True: dict with table data for batch processing
+        If skip_ai_analysis=False: dict with summary info (legacy behavior)
     """
     conn = None
     try:
@@ -373,18 +531,19 @@ def process_sub_table_task(df, file_id, clean_sheet_name, db_url, openai_key, da
         col_def_str = ",\n    ".join(column_defs)
         create_table_sql = f"CREATE TABLE IF NOT EXISTS {table_name} (\n    {col_def_str}\n);"
         
-        # 1. Generate AI Analysis (This is 1 API Call)
-        ai_data = generate_ai_analysis(df, clean_sheet_name, table_name, openai_key)
-        
+        # 1. AI Analysis: Skip here, will be done in batch later
+        # For now, set placeholders
         summary = None
         category = None
         keywords = None
         
-        if ai_data:
-            category = ai_data.get('category')
-            summary = ai_data.get('summary')
-            keywords = ai_data.get('keywords')
-            logging.info(f"Analysis for {clean_sheet_name}: Category={category}")
+        if skip_ai_analysis:
+            # Fast mode: use basic metadata
+            category = "General"
+            summary = f"Sheet with {len(df)} rows and {len(df.columns)} columns"
+            keywords = ", ".join(df.columns.tolist()[:5])
+            logging.info(f"Fast mode: Skipping AI analysis for {clean_sheet_name}")
+        # else: AI analysis will be done in batch after all sheets are parsed
 
         # 2. Prepare Columns Text
         columns_text = f"Sheet: {clean_sheet_name}\n"
@@ -394,17 +553,13 @@ def process_sub_table_task(df, file_id, clean_sheet_name, db_url, openai_key, da
             c_samples = ", ".join(col_meta['samples'])
             columns_text += f"Column: {c_name} (Original: {c_orig}) - Samples: {c_samples}\n"
         
-        # 3. Fetch Embeddings in Parallel (Summary, Keywords, Columns)
-        embedding_inputs = {
-            "summary": summary,
-            "keywords": keywords,
-            "columns": columns_text
-        }
+        # 3. Return data for batch embedding processing
+        # Don't fetch embeddings here - will be done in batch later
+        # This significantly reduces API calls
         
-        embeddings_map = get_embeddings_in_parallel(embedding_inputs, openai_key)
-        
-        summary_embedding = embeddings_map.get("summary")
-        keywords_embedding = embeddings_map.get("keywords")
+        # For now, set embeddings to None - will be updated in batch
+        summary_embedding = None
+        keywords_embedding = None
         # Add columns_embedding if logic requires (the previous code had it in one version, omitted in another)
         # Let's check create_metadata_tables - it does not seem to have columns_embedding in sheets_metadata? 
         # Wait, the Raghvender_tyagi version of create_metadata_tables DOES NOT have columns_embedding in sheets_metadata!
@@ -442,10 +597,17 @@ def process_sub_table_task(df, file_id, clean_sheet_name, db_url, openai_key, da
             )
         
         conn.commit()
+        
+        # Return data including DataFrame for batch AI analysis
         return {
             "name": clean_sheet_name,
             "category": category,
-            "summary": summary
+            "summary": summary,
+            "keywords": keywords,
+            "sheet_id": str(sheet_id),
+            "table_name": table_name,
+            "columns_text": columns_text,
+            "df": df.copy() if not skip_ai_analysis else None  # Include df for batch AI
         }
 
     except Exception as e:
@@ -614,10 +776,20 @@ def compute_file_hash(file_path):
             hash_md5.update(chunk)
     return hash_md5.hexdigest()
 
-def process_excel_file(file_path, db_url, openai_key, data_domain="general", sensitivity_level="internal", original_filename=None):
+def process_excel_file(file_path, db_url, openai_key, data_domain="general", sensitivity_level="internal", original_filename=None, skip_ai_analysis=False):
     """
     Main logic to ingest Excel file.
     Uses Threaded Pool and optimized flow.
+    
+    Args:
+        file_path: Path to Excel file
+        db_url: Database URL
+        openai_key: OpenAI API key
+        data_domain: Data domain for RBAC
+        sensitivity_level: Sensitivity level for RBAC
+        original_filename: Original filename (for uploads)
+        skip_ai_analysis: If True, skips AI analysis for faster ingestion (default: False)
+    
     Returns: "SUCCESS", "DUPLICATE", or raises Exception.
     """
     if not os.path.exists(file_path):
@@ -698,7 +870,7 @@ def process_excel_file(file_path, db_url, openai_key, data_domain="general", sen
                         clean_sheet_name = f"{sheet_name}_Table{sub_i+1}"
                     
                     # Process synchronously in this thread
-                    res = process_sub_table_task(sub_df, file_id, clean_sheet_name, db_url, openai_key, data_domain, sensitivity_level)
+                    res = process_sub_table_task(sub_df, file_id, clean_sheet_name, db_url, openai_key, data_domain, sensitivity_level, skip_ai_analysis)
                     if res:
                         local_results.append(res)
                 return local_results
@@ -716,9 +888,104 @@ def process_excel_file(file_path, db_url, openai_key, data_domain="general", sen
                 results = future.result()
                 sheet_summaries_list.extend(results)
 
-        # 4. Generate and Update File Level Metadata
-        # Need a fresh connection
-        if sheet_summaries_list:
+        # 3. Batch AI Analysis (NEW OPTIMIZATION)
+        # Process AI analysis for all sheets in a single API call
+        if sheet_summaries_list and not skip_ai_analysis:
+            # Collect sheets that need AI analysis (those without category/summary)
+            sheets_needing_analysis = []
+            sheet_indices = []
+            
+            for i, sheet_data in enumerate(sheet_summaries_list):
+                if sheet_data.get('df') is not None:  # Has DataFrame for analysis
+                    sheets_needing_analysis.append({
+                        'df': sheet_data['df'],
+                        'sheet_name': sheet_data['name'],
+                        'table_name': sheet_data['table_name']
+                    })
+                    sheet_indices.append(i)
+            
+            if sheets_needing_analysis:
+                logging.info(f"Generating AI analysis for {len(sheets_needing_analysis)} sheets in batch...")
+                
+                # Single batch API call for all AI analysis
+                ai_results = generate_ai_analysis_batch(sheets_needing_analysis, openai_key)
+                
+                # Update sheet data with AI analysis results
+                meta_conn = get_pooled_connection()
+                try:
+                    with meta_conn.cursor() as cur:
+                        for idx, ai_data in zip(sheet_indices, ai_results):
+                            if ai_data:
+                                sheet_summaries_list[idx]['category'] = ai_data.get('category', 'General')
+                                sheet_summaries_list[idx]['summary'] = ai_data.get('summary', '')
+                                sheet_summaries_list[idx]['keywords'] = ai_data.get('keywords', '')
+                                
+                                # Update database with AI analysis
+                                cur.execute(
+                                    """
+                                    UPDATE sheets_metadata 
+                                    SET category=%s, summary=%s, keywords=%s
+                                    WHERE sheet_id=%s
+                                    """,
+                                    (
+                                        sheet_summaries_list[idx]['category'],
+                                        sheet_summaries_list[idx]['summary'],
+                                        sheet_summaries_list[idx]['keywords'],
+                                        sheet_summaries_list[idx]['sheet_id']
+                                    )
+                                )
+                    meta_conn.commit()
+                    logging.info(f"Updated AI analysis for {len(sheets_needing_analysis)} sheets")
+                finally:
+                    release_pooled_connection(meta_conn)
+                
+                # Clean up DataFrames to free memory
+                for sheet_data in sheet_summaries_list:
+                    if 'df' in sheet_data:
+                        del sheet_data['df']
+
+        # 4. Batch Embedding Processing (EXISTING OPTIMIZATION)
+        # Collect all texts that need embeddings
+        if sheet_summaries_list and not skip_ai_analysis:
+            logging.info(f"Generating embeddings for {len(sheet_summaries_list)} sheets in batch...")
+            
+            # Prepare all texts for batch embedding
+            texts_to_embed = []
+            sheet_ids = []
+            
+            for sheet_data in sheet_summaries_list:
+                # Each sheet contributes 2 texts: summary and keywords
+                texts_to_embed.append(sheet_data.get('summary'))
+                texts_to_embed.append(sheet_data.get('keywords'))
+                sheet_ids.append(sheet_data.get('sheet_id'))
+            
+            # Single batch API call for all embeddings
+            all_embeddings = get_embeddings_batch(texts_to_embed, openai_key)
+            
+            # Update database with embeddings
+            meta_conn = get_pooled_connection()
+            try:
+                with meta_conn.cursor() as cur:
+                    for i, sheet_data in enumerate(sheet_summaries_list):
+                        summary_emb = all_embeddings[i * 2] if i * 2 < len(all_embeddings) else None
+                        keywords_emb = all_embeddings[i * 2 + 1] if i * 2 + 1 < len(all_embeddings) else None
+                        
+                        cur.execute(
+                            """
+                            UPDATE sheets_metadata 
+                            SET summary_embedding=%s, keywords_embedding=%s
+                            WHERE sheet_id=%s
+                            """,
+                            (summary_emb, keywords_emb, sheet_data.get('sheet_id'))
+                        )
+                meta_conn.commit()
+                logging.info(f"Updated embeddings for {len(sheet_summaries_list)} sheets")
+            finally:
+                release_pooled_connection(meta_conn)
+
+        # 5. Generate and Update File Level Metadata
+        # Skip in fast mode to save API calls
+        if sheet_summaries_list and not skip_ai_analysis:
             logging.info("Generating file-level summary...")
             file_ai = generate_file_level_analysis(file_name, sheet_summaries_list, openai_key)
             if file_ai:

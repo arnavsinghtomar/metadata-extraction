@@ -1,11 +1,17 @@
 import os
 import json
 import logging
+import uuid
 import pandas as pd
 import plotly.express as px
 from openai import OpenAI
 from ingest_excel import get_embedding, get_db_connection
 import rbac
+
+# Import agents
+from agents.chart_agent import ChartAgent
+from agents.rbac_agent import RBACAgent
+from agents.base_agent import AgentTask
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -410,8 +416,20 @@ def process_retrieval(user_query, db_url, openai_key, user_role="Analyst"):
         sql = generate_sql_query(user_query, best_sheet, openai_key)
         steps['generated_sql'] = sql
         
-        # 2b. Enforce RBAC at runtime (Defense-in-depth)
-        rbac.validate_sql_access(sql, best_sheet)
+        # 2b. Enforce RBAC at runtime using RBACAgent
+        rbac_agent = RBACAgent(db_url=db_url)
+        rbac_task = AgentTask(
+            task_id=str(uuid.uuid4()),
+            task_type="validate_sql",
+            payload={
+                "sql_query": sql,
+                "sheet_info": best_sheet
+            }
+        )
+        rbac_response = rbac_agent.execute(rbac_task)
+        
+        if rbac_response.status.value == "failed":
+            return {"error": rbac_response.error}
         
     except PermissionError as e:
         return {"error": str(e)}
@@ -430,13 +448,22 @@ def process_retrieval(user_query, db_url, openai_key, user_role="Analyst"):
     answer = synthesize_answer(user_query, sql, df, best_sheet, openai_key)
     steps['final_answer'] = answer
     
-    # 5. Charting
+    # 5. Charting using ChartAgent
     if df is not None and not df.empty:
-        chart_spec = decide_chart(user_query, df, openai_key)
-        steps['chart_spec'] = chart_spec
-        if chart_spec.get("show_chart"):
-            fig = render_chart(df, chart_spec)
-            if fig:
-                steps['chart'] = fig
+        chart_agent = ChartAgent(openai_key=openai_key)
+        chart_task = AgentTask(
+            task_id=str(uuid.uuid4()),
+            task_type="generate_visualization",
+            payload={
+                "user_query": user_query,
+                "dataframe": df
+            }
+        )
+        chart_response = chart_agent.execute(chart_task)
+        
+        if chart_response.status.value == "completed" and chart_response.result:
+            steps['chart_spec'] = chart_response.result.get('chart_spec')
+            if chart_response.result.get('chart'):
+                steps['chart'] = chart_response.result['chart']
 
     return steps

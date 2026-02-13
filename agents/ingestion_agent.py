@@ -80,6 +80,9 @@ class IngestionAgent(BaseAgent):
         Expected task.payload:
             - file_path: str (path to file)
             - original_filename: str (optional, for uploaded files)
+            - skip_ai_analysis: bool (optional, default False - enables fast mode)
+            - data_domain: str (optional, for RBAC)
+            - sensitivity_level: str (optional, for RBAC)
         """
         start_time = time.time()
         
@@ -95,6 +98,9 @@ class IngestionAgent(BaseAgent):
             
             file_path = task.payload["file_path"]
             original_filename = task.payload.get("original_filename")
+            skip_ai_analysis = task.payload.get("skip_ai_analysis", False)
+            data_domain = task.payload.get("data_domain", "general")
+            sensitivity_level = task.payload.get("sensitivity_level", "internal")
             
             # Check file exists
             if not os.path.exists(file_path):
@@ -109,7 +115,7 @@ class IngestionAgent(BaseAgent):
             file_ext = os.path.splitext(file_path)[1].lower()
             
             if file_ext in ['.xlsx', '.xls']:
-                result = self._process_excel(file_path, original_filename)
+                result = self._process_excel(file_path, original_filename, skip_ai_analysis, data_domain, sensitivity_level)
             elif file_ext == '.pdf':
                 result = self._process_pdf(file_path, original_filename)
             elif file_ext == '.csv':
@@ -142,13 +148,16 @@ class IngestionAgent(BaseAgent):
         except Exception as e:
             return self.handle_error(task, e)
     
-    def _process_excel(self, file_path: str, original_filename: Optional[str] = None) -> dict:
+    def _process_excel(self, file_path: str, original_filename: Optional[str] = None, skip_ai_analysis: bool = False, data_domain: str = "general", sensitivity_level: str = "internal") -> dict:
         """Process Excel file"""
         status = process_excel_file(
             file_path, 
             self.db_url, 
             self.openai_key,
-            original_filename=original_filename
+            data_domain=data_domain,
+            sensitivity_level=sensitivity_level,
+            original_filename=original_filename,
+            skip_ai_analysis=skip_ai_analysis
         )
         
         return {
