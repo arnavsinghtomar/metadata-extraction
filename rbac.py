@@ -79,10 +79,12 @@ def validate_sql_access(sql_query, sheet_info):
         
         for pattern in forbidden_patterns:
             if re.search(pattern, sql_lower):
-                raise PermissionError(
+                error_msg = (
                     f"🔒 Access Denied: Raw row-level queries not allowed for {sheet_info.get('data_domain', 'this')} data. "
-                    f"Only aggregated summaries are permitted."
+                    f"Violation: Forbidden pattern '{pattern}' found."
                 )
+                logging.warning(error_msg)
+                raise PermissionError(error_msg)
         
         # Must contain at least one aggregation function or a GROUP BY
         required_patterns = [r'sum\(', r'avg\(', r'count\(', r'max\(', r'min\(', r'group\s+by']
@@ -90,8 +92,8 @@ def validate_sql_access(sql_query, sheet_info):
         has_aggregation = any(re.search(pattern, sql_lower) for pattern in required_patterns)
         
         if not has_aggregation:
-            raise PermissionError(
-                f"🔒 Access Denied: You must use aggregation functions (SUM, COUNT, AVG) for this data."
-            )
+            error_msg = f"🔒 Access Denied: You must use aggregation functions (SUM, COUNT, AVG) for {sheet_info.get('data_domain', 'this')} data."
+            logging.warning(error_msg)
+            raise PermissionError(error_msg)
     
     return True
