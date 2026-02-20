@@ -81,7 +81,7 @@ with tab_local:
     with col_s:
         sensitivity = st.selectbox("Sensitivity", ["public", "internal", "confidential", "restricted"], index=1, key="local_sens")
     
-    uploaded_files = st.file_uploader("Upload Excel Files (Max 1500)", type=["xlsx", "xls"], accept_multiple_files=True, key="local_uploader")
+    uploaded_files = st.file_uploader("Upload Financial Files (Max 1500)", type=["xlsx", "xls", "csv", "pdf", "txt", "doc", "docx"], accept_multiple_files=True, key="local_uploader")
     if uploaded_files:
         if len(uploaded_files) > 1500:
             st.error("Maximum 1500 files allowed. Please remove some.")
@@ -98,16 +98,18 @@ with tab_local:
                 # Wrapper for parallel execution
                 def process_single_file(uploaded_file):
                     try:
-                        # Save to temp file
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp_file:
+                        # Save to temp file with appropriate extension
+                        file_ext = os.path.splitext(uploaded_file.name)[1]
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp_file:
                             tmp_file.write(uploaded_file.getvalue())
                             tmp_path = tmp_file.name
                         
-                        # Run ingestion
-                        status = process_excel_file(tmp_path, DB_URL, OPENROUTER_KEY, domain, sensitivity, original_filename=uploaded_file.name)
+                        # Run unified ingestion
+                        from ingest_unified import process_file
+                        result = process_file(tmp_path, DB_URL, OPENROUTER_KEY, domain, sensitivity, original_filename=uploaded_file.name)
                         
                         os.remove(tmp_path)
-                        return {"success": True, "status": status, "name": uploaded_file.name}
+                        return {"success": result['status'] in ['SUCCESS', 'DUPLICATE'], "status": result['status'], "name": uploaded_file.name, "file_type": result.get('file_type', 'unknown')}
                     except Exception as e:
                         return {"success": False, "name": uploaded_file.name, "error": str(e)}
 
@@ -164,7 +166,7 @@ with tab_drive:
                 with st.spinner("Fetching files..."):
                     results = service.files().list(
                         pageSize=30,
-                        q="mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' or mimeType='application/vnd.ms-excel'",
+                        q="mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' or mimeType='application/vnd.ms-excel' or mimeType='text/csv' or mimeType='application/pdf' or mimeType='text/plain' or mimeType='application/vnd.openxmlformats-officedocument.wordprocessingml.document' or mimeType='application/msword'",
                         fields="files(id, name, mimeType)"
                     ).execute()
                     st.session_state.drive_files = results.get("files", [])
@@ -203,13 +205,15 @@ with tab_drive:
                         while not done:
                             status, done = downloader.next_chunk()
                         
-                        # 2. Save to temp file
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp_file:
+                        # 2. Save to temp file with appropriate extension
+                        file_ext = os.path.splitext(selected_name)[1] or '.xlsx'
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp_file:
                             tmp_file.write(fh.getvalue())
                             tmp_path = tmp_file.name
                         
-                        # 3. Run ingestion (same logic as local)
-                        process_excel_file(tmp_path, DB_URL, OPENROUTER_KEY, g_domain, g_sensitivity)
+                        # 3. Run unified ingestion
+                        from ingest_unified import process_file
+                        result = process_file(tmp_path, DB_URL, OPENROUTER_KEY, g_domain, g_sensitivity, original_filename=selected_name)
                         
                         st.success(f"Successfully processed {selected_name}")
                         os.remove(tmp_path)

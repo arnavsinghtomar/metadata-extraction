@@ -8,10 +8,8 @@ from openai import OpenAI
 from ingest_excel import get_embedding, get_db_connection
 import rbac
 
-# Import agents
-from agents.chart_agent import ChartAgent
-from agents.rbac_agent import RBACAgent
-from agents.base_agent import AgentTask
+# NOTE: Agent imports are done lazily inside functions to avoid circular imports
+# retrieval.py <- agents/__init__.py <- query_agent.py <- retrieval.py (circular!)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -42,16 +40,17 @@ def search_relevant_sheets(query, db_url, openai_key, user_role, limit=3):
                 s.data_domain,
                 s.sensitivity_level,
                 f.file_name,
-                p.allow_aggregation,
-                p.allow_raw_rows,
+                COALESCE(p.allow_aggregation, true)  AS allow_aggregation,
+                COALESCE(p.allow_raw_rows, false)     AS allow_raw_rows,
                 (s.summary_embedding <=> %s::vector) as distance
             FROM sheets_metadata s
             JOIN files_metadata f ON s.file_id = f.file_id
-            JOIN retrieval_policies p 
+            LEFT JOIN retrieval_policies p 
               ON p.data_domain = s.data_domain
              AND p.sensitivity_level = s.sensitivity_level
-            WHERE p.role = %s
-              AND p.allowed = true
+             AND p.role = %s
+             AND p.allowed = true
+            WHERE (p.policy_id IS NOT NULL OR s.data_domain IS NULL OR s.sensitivity_level IS NULL)
             ORDER BY 
                 (CASE WHEN f.file_name ILIKE %s THEN 0 ELSE 1 END) ASC,
                 distance ASC
@@ -148,11 +147,44 @@ def generate_sql_query(user_query, sheet_info, openai_key):
     
     Goal: Write a valid PostgreSQL query to answer the question while respecting access rules.
     
-    Rules:
+    Core Rules:
     1. Use ONLY the table and columns provided in the schema.
     2. Use ILIKE for flexible text matching (e.g. WHERE vendor ILIKE '%amazon%').
-    3. If the user asks for a total, use SUM/COUNT.
-    4. Return ONLY the raw SQL query. No markdown (```sql), no explanations.
+    3. Return ONLY the raw SQL query. No markdown, no explanations.
+    
+     ARITHMETIC OPERATIONS — Follow these patterns:
+    
+    | User asks...                           | SQL to generate                                               |
+    |----------------------------------------|---------------------------------------------------------------|
+    | total / sum of a column                | SUM(column)                                                   |
+    | average / mean                         | AVG(column)                                                   |
+    | difference / minus / subtract          | SUM(revenue_col) - SUM(expense_col) AS net                    |
+    | profit margin / percentage             | ROUND(SUM(profit_col) * 100.0 / NULLIF(SUM(revenue_col),0),2) AS margin_pct |
+    | ratio between two columns              | ROUND(SUM(col_a)::numeric / NULLIF(SUM(col_b),0), 4) AS ratio |
+    | growth / change compared to last year  | Use LAG() or subquery to compute period-over-period change    |
+    | multiply columns                       | SUM(quantity_col * price_col) AS total_value                  |
+    | divide / per unit                      | ROUND(SUM(amount_col)::numeric / NULLIF(SUM(units_col),0), 2) AS per_unit |
+    | cumulative / running total             | SUM(col) OVER (ORDER BY date_col) AS running_total            |
+    | rank / top N                           | ORDER BY metric_col DESC LIMIT N                              |
+    | standard deviation / variance          | STDDEV(column), VARIANCE(column)                              |
+    | min and max range                      | MAX(col) - MIN(col) AS range                                  |
+    
+    ARITHMETIC RULES:
+    - Always use NULLIF(divisor, 0) to avoid division-by-zero errors.
+    - Always cast to ::numeric before division to avoid integer truncation.
+    - Use ROUND(..., 2) for percentages and ratios.
+    - Use aliases (AS) to name calculated columns clearly.
+    - For multi-step calculations, use a CTE (WITH clause) for clarity.
+    
+    EXAMPLE — "What is the profit margin by category?":
+    SELECT category,
+           SUM(revenue) AS total_revenue,
+           SUM(cost) AS total_cost,
+           SUM(revenue) - SUM(cost) AS profit,
+           ROUND((SUM(revenue) - SUM(cost)) * 100.0 / NULLIF(SUM(revenue), 0), 2) AS margin_pct
+    FROM {table_name}
+    GROUP BY category
+    ORDER BY margin_pct DESC;
     """
     
     response = client.chat.completions.create(
@@ -380,76 +412,118 @@ def process_retrieval(user_query, db_url, openai_key, user_role="Analyst"):
     """
     steps = {}
     
-    # 1. Search
-    sheets = search_relevant_sheets(user_query, db_url, openai_key, user_role, limit=1)
+    # 1. Search (Fetch top 3 instead of 1 to handle cases where top match is wrong)
+    sheets = search_relevant_sheets(user_query, db_url, openai_key, user_role, limit=3)
     if not sheets:
-        return {"error": "No relevant data found for your query."}
+        return {"error": "No relevant data found for your query. (Check if file is uploaded and you have access)"}
     
-    best_sheet = sheets[0]
-    steps['sheet_match'] = best_sheet
+    candidate_results = []
     
-    # Check if this is a metadata question ("Which file...")
-    if is_metadata_query(user_query):
-        # Skip SQL generation for metadata questions
-        steps['generated_sql'] = "-- Metadata lookup (SQL skipped)"
-        # Create a fake DF containing the metadata answer
-        df = pd.DataFrame([{
-            "File Name": best_sheet['file_name'],
-            "Sheet Name": best_sheet['sheet_name'],
-            "Table Name": best_sheet['table_name'],
-            "Category": best_sheet['category'],
-            "Match Confidence": f"{1 - best_sheet['distance']:.2f}"
-        }])
-        steps['results_df'] = df
+    # Iterate through potential matches
+    for i, sheet in enumerate(sheets):
+        logging.info(f"Trying sheet match #{i+1}: {sheet['file_name']} - {sheet['sheet_name']}")
         
-        # Synthesize answer directly from this metadata
-        answer = f"The information you asked about is located in the file **{best_sheet['file_name']}**.\n\n" \
-                 f"**Details:**\n" \
-                 f"- **Sheet Name:** {best_sheet['sheet_name']}\n" \
-                 f"- **Category:** {best_sheet['category']}\n" \
-                 f"- **Confidence:** {1 - best_sheet['distance']:.2%}"
-        steps['final_answer'] = answer
-        return steps
+        # Check if this is a metadata question ("Which file...")
+        if is_metadata_query(user_query):
+            # ... (Metadata logic remains same)
+            steps['sheet_match'] = sheet
+            steps['generated_sql'] = "-- Metadata lookup"
+            df = pd.DataFrame([{
+                "File Name": sheet['file_name'],
+                "Sheet Name": sheet['sheet_name'],
+                "Table Name": sheet['table_name'],
+                "Category": sheet['category'],
+                "Confidence": f"{1 - sheet['distance']:.2f}"
+            }])
+            steps['results_df'] = df
+            steps['final_answer'] = f"Found relevant data in **{sheet['file_name']}** (Sheet: {sheet['sheet_name']})."
+            return steps
 
-    # 2. Generate SQL
-    try:
-        sql = generate_sql_query(user_query, best_sheet, openai_key)
-        steps['generated_sql'] = sql
+        # 2. Generate SQL for this sheet
+        try:
+            sql = generate_sql_query(user_query, sheet, openai_key)
+            
+            # 2b. Enforce RBAC
+            from agents.rbac_agent import RBACAgent
+            from agents.base_agent import AgentTask
+            rbac_agent = RBACAgent(db_url=db_url)
+            rbac_task = AgentTask(
+                task_id=str(uuid.uuid4()),
+                task_type="validate_sql",
+                payload={"sql_query": sql, "sheet_info": sheet}
+            )
+            rbac_result = rbac_agent.execute(rbac_task)
+            if rbac_result.status.value == "failed":
+                logging.warning(f"RBAC failed for {sheet['file_name']}: {rbac_result.error}")
+                continue
+                
+        except Exception as e:
+            logging.warning(f"SQL Gen failed for {sheet['file_name']}: {e}")
+            continue
+
+        # 3. Execute
+        df, error = execute_query(sql, db_url)
         
-        # 2b. Enforce RBAC at runtime using RBACAgent
-        rbac_agent = RBACAgent(db_url=db_url)
-        rbac_task = AgentTask(
-            task_id=str(uuid.uuid4()),
-            task_type="validate_sql",
-            payload={
-                "sql_query": sql,
-                "sheet_info": best_sheet
-            }
-        )
-        rbac_response = rbac_agent.execute(rbac_task)
-        
-        if rbac_response.status.value == "failed":
-            return {"error": rbac_response.error}
-        
-    except PermissionError as e:
-        return {"error": str(e)}
-    except Exception as e:
-        return {"error": f"Failed to generate query: {e}"}
-    
-    # 3. Execute
-    df, error = execute_query(sql, db_url)
-    if error:
-        steps['error'] = f"SQL Execution Failed: {error}"
+        if error:
+            logging.warning(f"SQL execution error on {sheet['file_name']}: {error}")
+            continue
+            
+        if df is not None:
+            # Check for "meaningful" data (not just 0 or null)
+            is_meaningful = False
+            if not df.empty:
+                # Check if any value is non-zero/non-null
+                # For single row/col results (aggregations):
+                if df.shape == (1, 1):
+                    val = df.iloc[0, 0]
+                    if pd.notna(val) and val != 0 and val != "0":
+                        is_meaningful = True
+                else:
+                    is_meaningful = True # Multiple rows usually mean data found
+            
+            candidate_results.append({
+                "sheet": sheet,
+                "sql": sql,
+                "df": df,
+                "meaningful": is_meaningful
+            })
+            
+            # Optimization: If we found meaningful data in the *very first* (best) match, 
+            # we can trust it and stop early.
+            if i == 0 and is_meaningful:
+                break
+
+    # Decision Logic: Select Best Candidate
+    if not candidate_results:
+        steps['error'] = "Could not find valid results in any relevant file."
         return steps
         
-    steps['results_df'] = df
+    # Prioritize meaningful (non-zero) results
+    best_candidate = None
+    
+    # 1. Look for meaningful result
+    for cand in candidate_results:
+        if cand['meaningful']:
+            best_candidate = cand
+            break
+            
+    # 2. If no meaningful result, fallback to the first successful execution (even if 0)
+    if not best_candidate:
+        best_candidate = candidate_results[0]
+        
+    # Finalize steps with best candidate
+    steps['sheet_match'] = best_candidate['sheet']
+    steps['generated_sql'] = best_candidate['sql']
+    steps['results_df'] = best_candidate['df']
     
     # 4. Synthesize
-    answer = synthesize_answer(user_query, sql, df, best_sheet, openai_key)
+    answer = synthesize_answer(user_query, best_candidate['sql'], best_candidate['df'], best_candidate['sheet'], openai_key)
     steps['final_answer'] = answer
     
-    # 5. Charting using ChartAgent
+    # 5. Charting using ChartAgent (lazy import to avoid circular)
     if df is not None and not df.empty:
+        from agents.chart_agent import ChartAgent
+        from agents.base_agent import AgentTask
         chart_agent = ChartAgent(openai_key=openai_key)
         chart_task = AgentTask(
             task_id=str(uuid.uuid4()),
