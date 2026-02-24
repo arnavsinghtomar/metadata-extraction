@@ -17,9 +17,12 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 def search_relevant_sheets(query, db_url, openai_key, user_role, limit=3):
     """
     Find relevant sheets using vector similarity + RBAC filtering.
+    Returns (results, diagnostics)
     """
+    logging.info(f"🔍 Searching relevant sheets for Query: '{query}' | User Role: {user_role}")
     embedding = get_embedding(query, openai_key)
     if not embedding:
+        logging.error("❌ Failed to generate embedding for the query.")
         return []
 
     conn = get_db_connection(db_url)
@@ -31,7 +34,13 @@ def search_relevant_sheets(query, db_url, openai_key, user_role, limit=3):
         # Simple heuristic: If file_name contains the full query (rare) or query contains file_name.
         
         sql = """
-            SELECT 
+            WITH sensitivity_ranks AS (
+                SELECT 'public' as level, 1 as rank
+                UNION ALL SELECT 'internal', 2
+                UNION ALL SELECT 'confidential', 3
+                UNION ALL SELECT 'restricted', 4
+            )
+            SELECT DISTINCT ON (s.sheet_id)
                 s.sheet_id, 
                 s.table_name, 
                 s.sheet_name, 
@@ -45,23 +54,34 @@ def search_relevant_sheets(query, db_url, openai_key, user_role, limit=3):
                 (s.summary_embedding <=> %s::vector) as distance
             FROM sheets_metadata s
             JOIN files_metadata f ON s.file_id = f.file_id
-            LEFT JOIN retrieval_policies p 
-              ON p.data_domain = s.data_domain
-             AND p.sensitivity_level = s.sensitivity_level
-             AND p.role = %s
-             AND p.allowed = true
-            WHERE (p.policy_id IS NOT NULL OR s.data_domain IS NULL OR s.sensitivity_level IS NULL)
+            JOIN sensitivity_ranks sr_s ON s.sensitivity_level = sr_s.level
+            JOIN retrieval_policies p ON p.data_domain = s.data_domain
+            JOIN sensitivity_ranks sr_p ON p.sensitivity_level = sr_p.level
+            WHERE p.role = %s
+              AND p.allowed = true
+              AND sr_p.rank >= sr_s.rank
             ORDER BY 
+                s.sheet_id,
+                sr_p.rank ASC, -- Pick the least restrictive applicable policy
                 (CASE WHEN f.file_name ILIKE %s THEN 0 ELSE 1 END) ASC,
                 distance ASC
-            LIMIT %s
         """
         # Prepare fuzzy match param
         like_query = f"%{query}%"
         
-        cur.execute(sql, (embedding, user_role, like_query, limit))
+        # We need to wrap the final results to re-sort by distance since DISTINCT ON required sorting by sheet_id first
+        wrapped_sql = f"""
+            SELECT * FROM ({sql}) sub
+            ORDER BY (CASE WHEN file_name ILIKE %s THEN 0 ELSE 1 END) ASC, distance ASC
+            LIMIT %s
+        """
+        
+        cur.execute(wrapped_sql, (embedding, user_role, like_query, like_query, limit))
         results = []
-        for row in cur.fetchall():
+        rows = cur.fetchall()
+        logging.info(f"📊 Query executed. Found {len(rows)} candidate sheets matching Role & Keyword filters.")
+        
+        for row in rows:
             results.append({
                 "sheet_id": row[0],
                 "table_name": row[1],
@@ -75,10 +95,30 @@ def search_relevant_sheets(query, db_url, openai_key, user_role, limit=3):
                 "allow_raw_rows": row[9],
                 "distance": row[10]
             })
-        return results
+        
+        if not results:
+            logging.warning(f"⚠️ No sheets passed the RBAC and similarity filters for role: {user_role}")
+            
+            # Simple Diagnostic: Check if any sheets exist at all in the DB
+            cur.execute("SELECT count(*) FROM sheets_metadata")
+            total_sheets = cur.fetchone()[0]
+            
+            # Check if sheets exist but were blocked by RBAC for this role
+            cur.execute("SELECT count(*) FROM sheets_metadata s JOIN files_metadata f ON s.file_id = f.file_id")
+            # Without RBAC filter
+            # (In a real scenario we might check for 'close' embedding matches that were filter out)
+            
+            diag = {
+                "total_sheets_in_db": total_sheets,
+                "role": user_role,
+                "reason": "No matches found after RBAC filtering." if total_sheets > 0 else "Database is empty."
+            }
+            return [], diag
+            
+        return results, {}
     except Exception as e:
         logging.error(f"Search failed: {e}")
-        return []
+        return [], {"error": str(e)}
     finally:
         conn.close()
 
@@ -238,7 +278,30 @@ def synthesize_answer(user_query, sql, df, sheet_info, openai_key):
     )
     
     if df is None or df.empty:
-        return "The query returned no results."
+        prompt = f"""
+        The user asked: "{user_query}"
+        
+        We tried to find the answer by running this SQL:
+        {sql}
+        
+        However, the query returned NO results. 
+        Based on the user's question and the SQL, please explain in a friendly, natural way why there might be no data.
+        Possible reasons to consider:
+        - The specific filters (WHERE clause) might be too restrictive.
+        - The requested time period or category might not be in the data.
+        - The user might be asking for something that isn't tracked in this specific table.
+        
+        Do not say "I don't know". Instead, suggest how the user could broaden their search or what might be missing.
+        """
+        response = client.chat.completions.create(
+            model="openai/gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a helpful data analyst explaining why a search returned no results."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3
+        )
+        return response.choices[0].message.content
     
     # Create a compact string representation of the data
     if len(df) > 10:
@@ -412,10 +475,30 @@ def process_retrieval(user_query, db_url, openai_key, user_role="Analyst"):
     """
     steps = {}
     
-    # 1. Search (Fetch top 3 instead of 1 to handle cases where top match is wrong)
-    sheets = search_relevant_sheets(user_query, db_url, openai_key, user_role, limit=3)
+    # 1. Search (Fetch top 3 to handle cases where top match is wrong)
+    sheets, diagnostics = search_relevant_sheets(user_query, db_url, openai_key, user_role, limit=3)
     if not sheets:
-        return {"error": "No relevant data found for your query. (Check if file is uploaded and you have access)"}
+        logging.warning(f"🚫 Retrieval Failed: No relevant sheets found for query: '{user_query}' (Role: {user_role})")
+        
+        # Ask LLM to explain why no sheets were found
+        client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=openai_key)
+        explainer_prompt = f"""
+        User Query: "{user_query}"
+        User Role: {user_role}
+        System Diagnostics: {json.dumps(diagnostics)}
+        
+        Please explain to the user why no matching records or files were found. 
+        If it's an RBAC issue (role restriction), explain it politely. 
+        If the database is empty, mention that no files have been uploaded yet.
+        Be helpful and suggest what they can do next.
+        """
+        resp = client.chat.completions.create(
+            model="openai/gpt-4o-mini",
+            messages=[{"role": "system", "content": "You explain data access issues to users."},
+                      {"role": "user", "content": explainer_prompt}],
+            temperature=0.3
+        )
+        return {"error": resp.choices[0].message.content}
     
     candidate_results = []
     
