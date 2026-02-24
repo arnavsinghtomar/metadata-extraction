@@ -210,3 +210,4 @@ def compute_business_health(db_url, openai_key, sheet_info, lookback_periods=3):
         "summary": executive_summary,
         "history": history_df.reset_index().to_dict() if not history_df.empty else None
     }
+#test line
